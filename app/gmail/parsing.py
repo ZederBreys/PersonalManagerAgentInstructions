@@ -9,17 +9,11 @@ network I/O.
 from __future__ import annotations
 
 import base64
-import re
 from datetime import datetime, timezone
 from email.message import Message
-from email.utils import parseaddr
+from email.utils import getaddresses
 from html.parser import HTMLParser
 from typing import Any
-
-# Match a bare email address; used only as a fallback when ``parseaddr`` cannot
-# extract an address. The whitelist does an exact-match afterwards, so a false
-# extraction here can only result in "not allowed", never in a wrong allow.
-_EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+\.[\w.-]+")
 
 
 def get_header(headers: list[dict[str, str]] | None, name: str) -> str | None:
@@ -35,15 +29,36 @@ def get_header(headers: list[dict[str, str]] | None, name: str) -> str | None:
 
 
 def extract_email(from_header: str | None) -> str | None:
-    """Extract the bare email address from a ``From`` header value."""
+    """Extract the sender address from a ``From`` header value, or ``None``.
+
+    Only the structured RFC 5322 parse (``email.utils.getaddresses``) is
+    trusted. The header must contain exactly one mailbox with a well-formed
+    address; anything malformed or ambiguous is rejected rather than guessed.
+    In particular, an address-like string in the display name or elsewhere in
+    a header that does not parse (e.g. ``support@x <attacker@y>``) must never
+    become the sender — the sender whitelist is checked against this value.
+    """
 
     if not from_header:
         return None
-    _, address = parseaddr(from_header)
-    if address:
-        return address
-    match = _EMAIL_RE.search(from_header)
-    return match.group(0) if match else None
+    mailboxes = getaddresses([from_header])
+    if len(mailboxes) != 1:
+        return None  # several senders: ambiguous
+    _, address = mailboxes[0]
+    if not _is_well_formed_address(address):
+        return None
+    return address
+
+
+def _is_well_formed_address(address: str) -> bool:
+    """A single ``local@domain`` without whitespace or leftover header syntax."""
+
+    if not address or address.count("@") != 1:
+        return False
+    if any(ch.isspace() or ch in '<>,;:"()[]' for ch in address):
+        return False
+    local, domain = address.split("@")
+    return bool(local) and "." in domain and not domain.startswith(".") and not domain.endswith(".")
 
 
 def normalize_email(address: str | None) -> str | None:

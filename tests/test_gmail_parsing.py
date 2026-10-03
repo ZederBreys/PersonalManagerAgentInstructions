@@ -285,3 +285,67 @@ def test_extract_body_ignores_malformed_parts() -> None:
 
 def test_internal_date_out_of_range_returns_none() -> None:
     assert internal_date_to_datetime("99999999999999999999") is None
+
+
+# --- sender extraction security (display-name spoofing) ------------------------------
+# The whitelist is checked against extract_email(From). Only the structured
+# RFC 5322 parse may produce that address; nothing is guessed from free text.
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("John Doe <john@example.com>", "john@example.com"),
+        ("<john@example.com>", "john@example.com"),
+        ("john@example.com", "john@example.com"),
+        ('"Support, Team" <support@liteserver.nl>', "support@liteserver.nl"),
+        ("Поддержка LiteServer <support@liteserver.nl>", "support@liteserver.nl"),
+        ("=?utf-8?b?0J/QvtC00LTQtdGA0LbQutCw?= <support@liteserver.nl>", "support@liteserver.nl"),
+        ("admin@ztv.su (ZTV admin)", "admin@ztv.su"),
+        (" admin@ztv.su \r\n", "admin@ztv.su"),
+    ],
+)
+def test_extract_email_keeps_legitimate_rfc5322_forms(header: str, expected: str) -> None:
+    assert extract_email(header) == expected
+
+
+@pytest.mark.parametrize(
+    "header",
+    [
+        # Allowed address in an unquoted display name, real mailbox is the attacker's.
+        "support@liteserver.nl <attacker@evil.example>",
+        "Fake support@liteserver.nl Name <attacker@evil.example>",
+        # Several senders: ambiguous, never pick the first one.
+        "support@liteserver.nl, attacker@evil.example",
+        "support@liteserver.nl;attacker@evil.example",
+        # Malformed headers: no guessing from the text.
+        "support@liteserver.nl>evil",
+        "support@liteserver.nl <>",
+        "garbage text support@liteserver.nl more garbage",
+        "not an address at all",
+    ],
+)
+def test_extract_email_never_guesses_from_free_text(header: str) -> None:
+    address = extract_email(header)
+    assert address != "support@liteserver.nl"
+    assert address is None
+    assert is_allowed_sender(normalize_email(address)) is False
+
+
+def test_quoted_display_name_with_allowed_address_resolves_to_real_mailbox() -> None:
+    header = '"support@liteserver.nl" <attacker@evil.example>'
+    assert extract_email(header) == "attacker@evil.example"
+    assert is_allowed_sender(normalize_email(extract_email(header))) is False
+
+
+@pytest.mark.parametrize(
+    ("header", "allowed"),
+    [
+        ("Support <support@liteserver.nl>", True),
+        ("Attacker <attacker@evil.example>", False),
+        ("Fake Name <attacker@evil.example>", False),
+        ("support@liteserver.nl <attacker@evil.example>", False),
+    ],
+)
+def test_whitelist_decision_uses_parsed_sender_only(header: str, allowed: bool) -> None:
+    assert is_allowed_sender(normalize_email(extract_email(header))) is allowed
