@@ -1,0 +1,46 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python cache and build artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Test / tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local agent tooling metadata
+.refact/
+
+# IDE metadata
+.idea/
+.vscode/
+*.swp
+
+# Local runtime data
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# Google Sheets service-account credentials (secret JSON)
+service_account*.json
+google-service-account*.json
+
+# Gmail OAuth credentials (secret JSON)
+client_secret*.json
+token.json
+token.json.tmp

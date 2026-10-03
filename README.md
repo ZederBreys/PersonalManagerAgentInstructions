@@ -1,0 +1,144 @@
+🇷🇺 Русский | [🇬🇧 English](README.en.md)
+
+# Personal Manager
+
+Небольшой персональный менеджер для одного пользователя: события, напоминания,
+регулярные расходы, входящие письма и уведомления. Источник истины — SQLite;
+внешние сервисы используются только как вспомогательные каналы.
+
+## Возможности
+
+- **События** — разовые и ежегодные (`yearly`), корректная обработка 29 февраля.
+- **Напоминания** — производные от событий: «в день» и «за N дней», уникальность по паре (событие, дата).
+- **Регулярные расходы** — ежемесячные/квартальные/годовые; суммы хранятся в целых минимальных единицах (копейках), расчёт даты следующего платежа.
+- **Отслеживание задач** — таблица `job_runs` (pending/running/success/failed), детекция «зависших» задач и восстановление при запуске.
+- **Telegram-уведомления** — только важные события (провал задачи, прерванная задача).
+- **Google Sheets** — человеческий интерфейс: экспорт/импорт событий, расходов и напоминаний.
+- **Входящие + классификация DeepSeek** — категория, важность, резюме, флаг «требует действия».
+- **Gmail** — read-only импорт писем от разрешённых отправителей (точное сравнение адреса).
+
+## Архитектура
+
+SQLite — единственный источник истины; бизнес-логикой владеет Python. APScheduler
+только запускает задачи, а их состояние живёт в БД. Google Sheets — интерфейс для
+человека, Telegram — канал уведомлений, Gmail — read-only источник писем, DeepSeek —
+только семантическая классификация. LLM никогда не пишет в БД напрямую и не
+выполняет детерминированные расчёты.
+
+## Стек
+
+- Python 3.13+
+- SQLAlchemy 2.x (async) + aiosqlite
+- Alembic (миграции)
+- APScheduler 3.x
+- httpx
+- Pydantic + pydantic-settings
+- google-api-python-client, google-auth, google-auth-oauthlib
+
+## Требования
+
+- Python 3.13 или новее.
+- Для Telegram / Google Sheets / Gmail / DeepSeek — соответствующие учётные данные (см. «Конфигурация»).
+
+## Установка
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate      # Windows PowerShell
+pip install -e ".[dev]"
+```
+
+## Конфигурация
+
+Скопируйте `.env.example` в `.env` и заполните нужные значения. Файл `.env` не
+попадает в Git. Все переменные опциональны — без них приложение запускается, а
+соответствующая интеграция просто отключена.
+
+| Переменная | Назначение | По умолчанию |
+| --- | --- | --- |
+| `LOG_LEVEL` | Уровень логирования | `INFO` |
+| `DATABASE_URL` | URL SQLite (SQLAlchemy async) | `sqlite+aiosqlite:///./data/personal_manager.sqlite3` |
+| `JOB_STALE_TIMEOUT_SECONDS` | Через сколько секунд `running`-задача считается зависшей | `3600` |
+| `TELEGRAM_BOT_TOKEN` | Токен бота Telegram (пусто — Telegram отключён) | — |
+| `TELEGRAM_CHAT_ID` | ID чата для уведомлений (пусто — уведомления отключены) | — |
+| `TELEGRAM_POLL_TIMEOUT` | Таймаут long polling | `30` |
+| `GOOGLE_SERVICE_ACCOUNT_FILE` | Путь к JSON service-account для Sheets | — |
+| `GOOGLE_SPREADSHEET_ID` | ID таблицы Google Sheets | — |
+| `DEEPSEEK_API_KEY` | Ключ DeepSeek (пусто — классификация отключена) | — |
+| `DEEPSEEK_MODEL` | Модель DeepSeek | `deepseek-chat` |
+| `DEEPSEEK_TIMEOUT_SECONDS` | Таймаут запроса к DeepSeek | `30` |
+| `GMAIL_CLIENT_SECRET_FILE` | Путь к OAuth client-secret JSON | — |
+| `GMAIL_TOKEN_FILE` | Путь к OAuth token JSON | — |
+| `GMAIL_MAX_MESSAGES` | Лимит импортируемых писем за запуск | `100` |
+
+Пути `GOOGLE_SERVICE_ACCOUNT_FILE`, `GMAIL_CLIENT_SECRET_FILE` и `GMAIL_TOKEN_FILE`
+указывают на внешние credential-файлы; сами файлы не должны попадать в репозиторий.
+
+## Внешние интеграции
+
+- **Telegram** — только push-уведомления (провал/прерывание задачи) через Bot API (httpx).
+- **Google Sheets** — экспорт/импорт через service-account; импорт валидирует все строки до записи в БД.
+- **Gmail** — read-only импорт писем от whitelist-отправителей (`support@liteserver.nl`, `admin@ztv.su`), точное сравнение адреса.
+- **DeepSeek** — семантическая классификация входящих сообщений.
+
+## База данных
+
+SQLite через SQLAlchemy (async) и aiosqlite. Схема управляется Alembic:
+
+```bash
+alembic upgrade head     # применить миграции
+alembic check            # проверить расхождение моделей и миграций
+alembic downgrade base   # откатить все миграции
+```
+
+## Запуск
+
+```bash
+python -m app
+```
+
+Один проход: загрузка конфигурации, настройка логирования, восстановление
+«зависших» задач (с Telegram-уведомлением, если оно настроено), затем выход.
+
+Разовая авторизация Gmail (открывает браузер для OAuth-согласия):
+
+```bash
+python -m app.gmail
+```
+
+## Тестирование
+
+```bash
+pytest
+```
+
+## Безопасность
+
+Секреты хранятся только в `.env` и внешних credential-файлах и не должны попадать
+в Git. `.gitignore` исключает `.env`, credential-`*.json` и `*.sqlite3`. Токены,
+ключи и тела писем не логируются.
+
+## Структура проекта
+
+```text
+app/
+    config.py               # настройки (pydantic-settings)
+    db.py                   # async-движок, сессия, declarative base
+    dates.py                # чистые функции дат событий
+    expense_dates.py        # чистые функции дат расходов
+    events.py               # логика событий
+    reminders.py            # логика напоминаний
+    expenses.py             # логика расходов
+    job_runs.py             # состояние запусков задач
+    scheduler.py            # APScheduler и обёртка задач
+    notifications.py        # Telegram-уведомления
+    inbox.py                # сервис входящих сообщений
+    inbox_processing.py     # обработка входящих (связка с DeepSeek)
+    models/                 # SQLAlchemy-модели
+    telegram/               # клиент Telegram Bot API
+    google_sheets/          # клиент, мапперы, экспорт/импорт
+    gmail/                  # OAuth, клиент, парсер, импортёр
+    deepseek/               # клиент DeepSeek и схемы классификации
+alembic/                    # миграции
+tests/                      # тесты
+```
