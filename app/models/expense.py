@@ -58,6 +58,11 @@ class RecurringExpense(Base):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     next_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # One-time key of the Google Sheets row this expense was created from;
+    # makes creation from Sheets idempotent (see app.google_sheets.sync).
+    sheet_key: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, unique=True, index=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

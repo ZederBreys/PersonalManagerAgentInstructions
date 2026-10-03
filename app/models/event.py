@@ -60,6 +60,11 @@ class Event(Base):
     )
     action_text: Mapped[str | None] = mapped_column(String(500), nullable=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # One-time key of the Google Sheets row this event was created from; makes
+    # creation from Sheets idempotent (see app.google_sheets.sync).
+    sheet_key: Mapped[str | None] = mapped_column(
+        String(32), nullable=True, unique=True, index=True
+    )
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(

@@ -189,14 +189,15 @@ def test_import_events_unknown_id_rejected(schema: None) -> None:
     asyncio.run(_run())
 
 
-def test_import_events_empty_id_rejected(schema: None) -> None:
+def test_import_events_new_row_missing_required_fields_rejected(schema: None) -> None:
     async def _run() -> None:
         async with db.get_session() as session:
             client = FakeClient({"Events": [EVENT_HEADERS, ["", "X", "", "", "", "", ""]]})
             errors = await import_events(session, client)
 
         assert len(errors) == 1
-        assert "ID is empty" in str(errors[0])
+        assert "Required for a new row" in str(errors[0])
+        assert "Дата" in str(errors[0])
 
     asyncio.run(_run())
 
@@ -336,8 +337,8 @@ def test_export_events_clears_stale_tail_when_old_has_more_rows(schema: None) ->
         async with db.get_session() as session:
             old = [
                 EVENT_HEADERS,
-                ["1", "Old1", "2026-01-01", "none", "0", "", "да"],
-                ["2", "Old2", "2026-01-02", "none", "0", "", "да"],
+                [str(e.id), "Old1", "2026-01-01", "none", "0", "", "да"],
+                ["", "", "", "", "", "", ""],
             ]
             client = FakeClient({"Events": old})
             await export_events(session, client)
@@ -373,8 +374,8 @@ def test_export_clear_failure_keeps_newly_written_data(schema: None) -> None:
             await session.commit()
             old = [
                 EVENT_HEADERS,
-                ["1", "Old1", "2026-01-01", "none", "0", "", "да"],
-                ["2", "Old2", "2026-01-02", "none", "0", "", "да"],
+                [str(e.id), "Old1", "2026-01-01", "none", "0", "", "да"],
+                ["", "", "", "", "", "", ""],
             ]
             client = FakeClient({"Events": old}, fail_clear=True)
             with pytest.raises(GoogleSheetsError):
@@ -426,8 +427,8 @@ def test_import_expenses_execution_error_rolls_back_own_changes(schema: None) ->
                     ]
                 }
             )
-            with pytest.raises(ValueError):
-                await import_expenses(session, client)
+            errors = await import_expenses(session, client)
+            assert [e.row_number for e in errors] == [3]
 
             await session.commit()
 
@@ -435,9 +436,9 @@ def test_import_expenses_execution_error_rolls_back_own_changes(schema: None) ->
             x1 = await expenses.get_expense(session, id1)
             x2 = await expenses.get_expense(session, id2)
             x3 = await expenses.get_expense(session, id3)
-            assert x1.name == "X1"
-            assert x2.period.value == "monthly"
-            assert x3.name == "X3-CALLER"
+            assert x1.name == "X1-IMPORTED"  # the valid row is still applied
+            assert x2.period.value == "monthly"  # the failing row rolled back
+            assert x3.name == "X3-CALLER"  # caller's pending change untouched
 
     asyncio.run(_run())
 
@@ -475,8 +476,8 @@ def test_import_events_execution_error_rolls_back_own_changes(schema: None, monk
                     ]
                 }
             )
-            with pytest.raises(ValueError):
-                await import_events(session, client)
+            errors = await import_events(session, client)
+            assert [e.row_number for e in errors] == [3]
 
             await session.commit()
 
@@ -484,9 +485,9 @@ def test_import_events_execution_error_rolls_back_own_changes(schema: None, monk
             e1 = await events.get_event(session, id1)
             e2 = await events.get_event(session, id2)
             e3 = await events.get_event(session, id3)
-            assert e1.name == "E1"
-            assert e2.name == "E2"
-            assert e3.name == "E3-CALLER"
+            assert e1.name == "E1-NEW"  # the valid row is still applied
+            assert e2.name == "E2"  # the failing row rolled back
+            assert e3.name == "E3-CALLER"  # caller's pending change untouched
 
     asyncio.run(_run())
 

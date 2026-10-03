@@ -32,5 +32,20 @@ def test_get_settings_is_cached() -> None:
     assert get_settings() is get_settings()
 
 
-def test_main_runs_without_error(schema: None) -> None:
+def test_main_starts_and_stops_cleanly(schema: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``main`` blocks while running; here it is stopped shortly after startup."""
+
+    import asyncio
+
+    import app.main as main_module
+
+    real_run = main_module.run
+
+    async def run_then_stop(settings: Settings) -> None:
+        stop = asyncio.Event()
+        asyncio.get_running_loop().call_later(0.2, stop.set)
+        await real_run(settings, stop=stop)
+
+    monkeypatch.setattr(main_module, "run", run_then_stop)
+    monkeypatch.setattr(main_module, "get_settings", lambda: Settings(_env_file=None))
     main()

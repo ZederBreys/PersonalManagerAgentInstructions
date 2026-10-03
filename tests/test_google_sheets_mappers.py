@@ -126,9 +126,17 @@ def test_parse_event_row_empty_cells_omitted():
     assert fields == {"id": 1}
 
 
-def test_parse_event_row_empty_id_rejected():
+def test_parse_event_row_empty_id_means_new_row():
+    assert parse_event_row(["", "x"]) == {"id": None, "name": "x"}
+
+
+def test_parse_event_row_pending_key_kept_as_text():
+    assert parse_event_row(["new-0123456789ab", "x"])["id"] == "new-0123456789ab"
+
+
+def test_parse_event_row_garbage_id_rejected():
     with pytest.raises(ValueError):
-        parse_event_row(["", "x"])
+        parse_event_row(["abc", "x"])
 
 
 def test_parse_event_row_invalid_date_rejected():

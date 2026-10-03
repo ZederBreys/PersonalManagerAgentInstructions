@@ -75,6 +75,14 @@ class GmailClient:
             self._service = build("gmail", "v1", credentials=self._credentials)
         return self._service
 
+    def close(self) -> None:
+        """Close the underlying HTTP connection of a built service (if any)."""
+
+        close = getattr(self._service, "close", None)
+        if callable(close):
+            close()
+        self._service = None
+
     async def list_messages(
         self,
         *,
