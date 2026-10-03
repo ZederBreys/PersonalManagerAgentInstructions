@@ -33,6 +33,7 @@ htmlcov/
 # Local runtime data
 *.sqlite
 *.sqlite3
+*.sqlite3.lock
 *.db
 *.log
 

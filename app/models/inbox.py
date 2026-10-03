@@ -16,6 +16,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     Enum,
+    Integer,
     JSON,
     String,
     Text,
@@ -74,6 +75,12 @@ class InboxMessage(Base):
         "metadata", JSON, nullable=True
     )
     processed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Classification retry bookkeeping. The error of the last failed attempt is
+    # kept in ``metadata_["error"]``.
+    attempt_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Earliest retry time of a failed message; NULL means "now".
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utcnow)
 

@@ -60,6 +60,12 @@ def _validate_payment_day(payment_day: int) -> int:
     return payment_day
 
 
+def _validate_reminder_days(days: int) -> int:
+    if not isinstance(days, int) or isinstance(days, bool) or days < 0:
+        raise ValueError(f"reminder_days_before must be a non-negative integer: {days!r}")
+    return days
+
+
 async def create_expense(
     session: AsyncSession,
     *,
@@ -71,6 +77,7 @@ async def create_expense(
     next_payment_date: date,
     category: str | None = None,
     is_active: bool = True,
+    reminder_days_before: int = 3,
 ) -> RecurringExpense:
     """Create a RecurringExpense and add it to the session (caller commits)."""
 
@@ -83,6 +90,7 @@ async def create_expense(
         next_payment_date=next_payment_date,
         category=category,
         is_active=is_active,
+        reminder_days_before=_validate_reminder_days(reminder_days_before),
     )
     session.add(expense)
     await session.flush()
@@ -121,6 +129,7 @@ async def update_expense(
     category: str | None = None,
     is_active: bool | None = None,
     next_payment_date: date | None = None,
+    reminder_days_before: int | None = None,
     today: date | None = None,
 ) -> RecurringExpense:
     """Update fields of ``expense`` (caller commits).
@@ -158,6 +167,8 @@ async def update_expense(
         expense.category = category
     if is_active is not None:
         expense.is_active = is_active
+    if reminder_days_before is not None:
+        expense.reminder_days_before = _validate_reminder_days(reminder_days_before)
 
     if next_payment_date is not None:
         expense.next_payment_date = next_payment_date

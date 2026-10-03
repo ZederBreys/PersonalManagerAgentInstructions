@@ -16,7 +16,7 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
-from app import db, job_runs
+from app import db, job_runs, notification_outbox
 from app.telegram.client import TelegramAPIError, TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -56,6 +56,11 @@ async def status_text(job_names: Sequence[str]) -> str:
             if run.error and run.status.value == "failed":
                 line += f"\n  {run.error[:200]}"
             lines.append(line)
+        queue = await notification_outbox.queue_summary(session)
+    lines.append(
+        f"\nУведомления: в очереди {queue.get('pending', 0)}, "
+        f"отправляются {queue.get('sending', 0)}, доставлено {queue.get('delivered', 0)}"
+    )
     return "\n".join(lines)
 
 

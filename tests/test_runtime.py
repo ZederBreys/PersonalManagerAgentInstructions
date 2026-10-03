@@ -22,6 +22,7 @@ from app.gmail.auth import GmailAuthError
 from app.google_sheets.mappers import EVENT_HEADERS, event_to_row
 from app.jobs import (
     Services,
+    deliver_notifications,
     SheetsSyncError,
     build_jobs,
     daily_reminders,
@@ -30,6 +31,7 @@ from app.jobs import (
 )
 from app.models.event import Event
 from app.models.job_run import JobRun, JobRunStatus
+from app.models.notification import Notification
 from app.models.reminder import Reminder
 from app.notifications import make_streak_failure_notifier
 from app.scheduler import CANCELLED_ERROR, JobSpec, _execute_job, create_scheduler
@@ -65,7 +67,7 @@ class FakeTelegram:
         if self.fail_send:
             raise TelegramAPIError(description="telegram down")
         self.sent.append((chat_id, text))
-        return {}
+        return {"message_id": len(self.sent)}
 
     async def aclose(self) -> None:
         self.closed = True
@@ -467,7 +469,12 @@ async def _event(event_id: int) -> Event:
         return await session.get(Event, event_id)
 
 
-def test_daily_reminders_sends_once_and_marks_sent(schema: None) -> None:
+async def _notifications() -> list[Notification]:
+    async with db.get_session() as session:
+        return list((await session.execute(select(Notification).order_by(Notification.id))).scalars())
+
+
+def test_daily_reminders_queues_once_and_worker_delivers(schema: None) -> None:
     today = date(2026, 10, 3)
     telegram = FakeTelegram()
     services = Services(settings=_settings(), telegram=telegram)  # type: ignore[arg-type]
@@ -477,16 +484,22 @@ def test_daily_reminders_sends_once_and_marks_sent(schema: None) -> None:
         await daily_reminders(services, today=today)
         await daily_reminders(services, today=today)
         stored = await _reminders_of(event_id)
-        assert len(stored) == 1 and stored[0].is_sent is True
+        assert len(stored) == 1 and stored[0].is_sent is True  # handed to the outbox
+        [queued] = await _notifications()
+        assert queued.dedup_key == f"event-reminder:{stored[0].id}"
+        assert telegram.sent == []  # daily_reminders itself never talks to Telegram
+        await deliver_notifications(services)
+        await deliver_notifications(services)
 
     asyncio.run(_run())
     assert len(telegram.sent) == 1
     assert "Встреча" in telegram.sent[0][1] and "Купить торт" in telegram.sent[0][1]
 
 
-def test_daily_reminders_keeps_pending_when_telegram_fails(schema: None) -> None:
+def test_daily_reminders_survive_telegram_outage(schema: None) -> None:
     today = date(2026, 10, 3)
-    services = Services(settings=_settings(), telegram=FakeTelegram(fail_send=True))  # type: ignore[arg-type]
+    telegram = FakeTelegram(fail_send=True)
+    services = Services(settings=_settings(), telegram=telegram)  # type: ignore[arg-type]
 
     async def _run() -> None:
         past = today - timedelta(days=2)
@@ -494,19 +507,19 @@ def test_daily_reminders_keeps_pending_when_telegram_fails(schema: None) -> None
         async with db.get_session() as session:
             await reminders.generate_reminders(session, await session.get(Event, event_id))
             await session.commit()
-        with pytest.raises(RuntimeError, match="Telegram unavailable"):
-            await daily_reminders(services, today=today)
-        stored = await _reminders_of(event_id)
-        assert [r.is_sent for r in stored] == [False]
-        assert (await _event(event_id)).next_date == past  # not advanced: reminder kept
+        await daily_reminders(services, today=today)  # no Telegram needed to queue
+        await deliver_notifications(services)
+        [queued] = await _notifications()
+        assert queued.status.value == "pending" and queued.last_error
+        # The event advances; the queued reminder is unaffected by that.
+        assert (await _event(event_id)).next_date == date(2027, 10, 1)
 
     asyncio.run(_run())
 
 
-def test_daily_reminders_advances_yearly_event_after_sending(schema: None) -> None:
+def test_daily_reminders_advances_yearly_event_after_queueing(schema: None) -> None:
     today = date(2026, 10, 3)
-    telegram = FakeTelegram()
-    services = Services(settings=_settings(), telegram=telegram)  # type: ignore[arg-type]
+    services = Services(settings=_settings())
 
     async def _run() -> None:
         event_id = await _create_event(
@@ -517,15 +530,16 @@ def test_daily_reminders_advances_yearly_event_after_sending(schema: None) -> No
             await session.commit()
         await daily_reminders(services, today=today)
         assert (await _event(event_id)).next_date == date(2027, 10, 1)
+        # The missed reminder was queued before advancing regenerated reminders.
+        [queued] = await _notifications()
+        assert "Годовщина" in queued.text
 
     asyncio.run(_run())
-    assert len(telegram.sent) == 1  # the missed reminder went out before advancing
 
 
 def test_daily_reminders_skips_inactive_events(schema: None) -> None:
     today = date(2026, 10, 3)
-    telegram = FakeTelegram()
-    services = Services(settings=_settings(), telegram=telegram)  # type: ignore[arg-type]
+    services = Services(settings=_settings())
 
     async def _run() -> None:
         event_id = await _create_event(name="Off", next_date=today)
@@ -535,9 +549,9 @@ def test_daily_reminders_skips_inactive_events(schema: None) -> None:
             event.is_active = False
             await session.commit()
         await daily_reminders(services, today=today)
+        assert await _notifications() == []
 
     asyncio.run(_run())
-    assert telegram.sent == []
 
 
 def test_daily_reminders_imports_sheet_edits_before_exporting(schema: None) -> None:

@@ -26,7 +26,7 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import db, events, expenses, job_runs, reminders
+from app import db, events, expenses, job_runs, notification_outbox, reminders
 from app.config import Settings
 from app.deepseek.client import DeepSeekClient
 from app.gmail.client import GmailClient, create_client_from_settings as create_gmail_client
@@ -42,8 +42,8 @@ from app.google_sheets.sync import (
     import_expenses,
 )
 from app.inbox_processing import process_unprocessed
-from app.models.event import Event
-from app.notifications import notify_job_interrupted, notify_reminder
+from app.notifications import notify_job_interrupted
+from app.scheduled_notifications import queue_event_reminders, queue_payment_reminders
 from app.scheduler import JobSpec
 from app.telegram.client import TelegramClient
 
@@ -58,6 +58,10 @@ SHEETS_SYNC_INTERVAL = timedelta(minutes=30)
 DAILY_REMINDERS_HOUR_UTC = 9
 DAYTIME_END_HOUR_UTC = 21
 INBOX_BATCH_SIZE = 20
+NOTIFICATION_INTERVAL = timedelta(minutes=1)
+NOTIFICATION_BATCH_SIZE = 20
+# Finished job runs older than this are deleted by the health check.
+JOB_RUN_RETENTION = timedelta(days=30)
 
 
 class SheetsSyncError(RuntimeError):
@@ -124,8 +128,10 @@ async def health_check(services: Services) -> None:
     )
     if recovered:
         logger.warning("health_check: marked %d stale job run(s) as failed", recovered)
-    else:
-        logger.info("health_check: ok")
+    async with db.get_session() as session:
+        pruned = await job_runs.prune_finished(session, older_than=JOB_RUN_RETENTION)
+        await session.commit()
+    logger.info("health_check: ok (%d old job run(s) pruned)", pruned)
 
 
 # --- Google Sheets --------------------------------------------------------------
@@ -203,37 +209,13 @@ async def _ensure_upcoming_reminders(session: AsyncSession, today: date) -> int:
     return created
 
 
-async def _send_due_reminders(
-    services: Services, session: AsyncSession, today: date
-) -> tuple[int, bool]:
-    """Send due reminders via Telegram; mark each sent only after delivery.
-
-    Returns ``(sent, all_delivered)``. On the first delivery failure sending
-    stops and the remaining reminders stay pending for the next run.
-    """
-
-    if services.telegram is None or services.chat_id is None:
-        logger.warning("Telegram is not configured; due reminders are not sent")
-        return 0, True
-
-    sent = 0
-    for reminder in await reminders.get_due_reminders(session, today=today):
-        event = await session.get(Event, reminder.event_id)
-        if event is None or not event.is_active:
-            continue
-        delivered = await notify_reminder(
-            services.telegram, services.chat_id, event=event, reminder=reminder, today=today
-        )
-        if not delivered:
-            return sent, False
-        await reminders.mark_sent(session, reminder)
-        await session.commit()
-        sent += 1
-    return sent, True
-
-
 async def daily_reminders(services: Services, today: date | None = None) -> None:
-    """Send due event reminders and roll recurring events/expenses forward."""
+    """Queue due event and payment reminders and roll recurring items forward.
+
+    Nothing is sent from here: reminders go to the notification outbox in the
+    same transaction that marks them handled, and ``deliver_notifications``
+    sends them. A Telegram outage therefore delays reminders but loses none.
+    """
 
     today = today or date.today()
     async with services.data_lock, db.get_session() as session:
@@ -242,29 +224,48 @@ async def daily_reminders(services: Services, today: date | None = None) -> None
             problems = await _import_from_sheets(session, services.sheets)
 
         created = await _ensure_upcoming_reminders(session, today)
-        # Send before advancing: advancing a yearly event regenerates (deletes)
-        # its unsent reminders. If delivery failed, events are not advanced so
-        # their pending reminders survive until the next run.
-        sent, delivered = await _send_due_reminders(services, session, today)
-        advanced_events = (
-            await events.advance_due_events(session, today=today) if delivered else []
-        )
+        # Queue before advancing: advancing a yearly event regenerates (deletes)
+        # its unqueued reminders.
+        queued_events = await queue_event_reminders(session, today)
+        await session.commit()
+        advanced_events = await events.advance_due_events(session, today=today)
         advanced_expenses = await expenses.advance_due_expenses(session, today=today)
         await session.commit()
+        # After advancing, so the reminder targets the current payment cycle.
+        queued_payments = await queue_payment_reminders(session, today)
+        await session.commit()
         logger.info(
-            "daily_reminders: %d reminder(s) created, %d sent, %d event(s) and "
-            "%d expense(s) advanced",
+            "daily_reminders: %d reminder(s) created, %d event and %d payment "
+            "reminder(s) queued, %d event(s) and %d expense(s) advanced",
             created,
-            sent,
+            queued_events,
+            queued_payments,
             len(advanced_events),
             len(advanced_expenses),
         )
 
         if services.sheets is not None:
             await _export_to_sheets(session, services.sheets, problems)
-    if not delivered:
-        raise RuntimeError("Telegram unavailable; some due reminders were not sent")
     _raise_for_sheet_errors(problems)
+
+
+# --- notification outbox ----------------------------------------------------------
+
+
+async def deliver_notifications(services: Services) -> None:
+    """Send due outbox notifications via Telegram (at-least-once, with retries).
+
+    A Telegram failure is recorded on the notification itself (``last_error``,
+    backoff) and is not a job failure, so an outage does not trigger job-failure
+    alerts and this job can never produce notifications about itself.
+    """
+
+    assert services.telegram is not None and services.chat_id is not None
+    delivered, failed = await notification_outbox.deliver_due(
+        services.telegram, services.chat_id, limit=NOTIFICATION_BATCH_SIZE
+    )
+    if delivered or failed:
+        logger.info("deliver_notifications: %d delivered, %d failed", delivered, failed)
 
 
 # --- Gmail / inbox ----------------------------------------------------------------
@@ -330,6 +331,15 @@ def build_jobs(services: Services, *, now: datetime | None = None) -> list[JobSp
             run_at_startup=_is_daytime(now),
         ),
     ]
+    if services.telegram is not None and services.chat_id is not None:
+        jobs.append(
+            JobSpec(
+                "deliver_notifications",
+                partial(deliver_notifications, services),
+                _every(NOTIFICATION_INTERVAL),
+                run_at_startup=True,
+            )
+        )
     if services.sheets is not None:
         jobs.append(
             JobSpec(

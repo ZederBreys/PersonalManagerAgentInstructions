@@ -9,21 +9,18 @@ marker that makes notifications idempotent.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime
+from datetime import datetime
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app import job_runs
-from app.models.event import Event
 from app.models.job_run import JobRun, JobRunStatus
-from app.models.reminder import Reminder
 from app.telegram.client import TelegramAPIError, TelegramClient
 
 logger = logging.getLogger(__name__)
 
 JOB_FAILED_TITLE = "🔴 Job failed"
 JOB_INTERRUPTED_TITLE = "⚠️ Job interrupted"
-REMINDER_TITLE = "🔔 Напоминание"
 
 
 def _format_timestamp(value: datetime | None) -> str:
@@ -171,39 +168,3 @@ def make_streak_failure_notifier(telegram: TelegramClient | None, chat_id: int |
         await notify_job_failed(session, run, telegram=telegram, chat_id=chat_id)
 
     return _notify
-
-
-def _format_reminder_message(event: Event, reminder: Reminder, today: date) -> str:
-    days_left = (event.next_date - today).days
-    if days_left > 0:
-        when = f"через {days_left} дн."
-    elif days_left == 0:
-        when = "сегодня"
-    else:
-        when = "уже прошло"
-    lines = [event.name, "", f"Дата: {event.next_date.strftime('%d.%m.%Y')} ({when})"]
-    if event.action_text:
-        lines += ["", event.action_text]
-    return "\n".join(lines)
-
-
-async def notify_reminder(
-    telegram: TelegramClient | None,
-    chat_id: int | None,
-    *,
-    event: Event,
-    reminder: Reminder,
-    today: date,
-) -> bool:
-    """Send one event reminder; return ``True`` only if it was delivered.
-
-    The caller marks the reminder as sent only after a ``True`` result, so a
-    Telegram outage leaves it pending for the next run.
-    """
-
-    return await notify(
-        telegram,
-        chat_id,
-        title=REMINDER_TITLE,
-        message=_format_reminder_message(event, reminder, today),
-    )

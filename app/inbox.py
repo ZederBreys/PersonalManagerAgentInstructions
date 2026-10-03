@@ -9,7 +9,7 @@ orchestration layer (``app/inbox_processing.py``) owns the commits.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -112,16 +112,74 @@ async def list_failed(
     return list(result.scalars().all())
 
 
+async def list_due_for_classification(
+    session: AsyncSession,
+    *,
+    max_attempts: int,
+    now: datetime | None = None,
+    limit: int | None = None,
+) -> list[InboxMessage]:
+    """Return ``new`` messages and ``failed`` ones whose retry time has come.
+
+    Messages that already used ``max_attempts`` attempts are not retried.
+    """
+
+    now = now or utcnow()
+    retry_due = (
+        (InboxMessage.status == InboxStatus.FAILED)
+        & (InboxMessage.attempt_count < max_attempts)
+        & (InboxMessage.next_attempt_at.is_(None) | (InboxMessage.next_attempt_at <= now))
+    )
+    stmt = (
+        select(InboxMessage)
+        .where((InboxMessage.status == InboxStatus.NEW) | retry_due)
+        .order_by(InboxMessage.id)
+    )
+    if limit is not None:
+        stmt = stmt.limit(limit)
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def recover_stale_processing(
+    session: AsyncSession, *, timeout: timedelta, now: datetime | None = None
+) -> list[InboxMessage]:
+    """Turn ``processing`` messages abandoned by a crash into retryable ``failed``.
+
+    A message is abandoned when its attempt started more than ``timeout`` ago
+    (or has no start time, e.g. from before attempts were tracked).
+    """
+
+    now = now or utcnow()
+    result = await session.execute(
+        select(InboxMessage).where(
+            InboxMessage.status == InboxStatus.PROCESSING,
+            InboxMessage.last_attempt_at.is_(None)
+            | (InboxMessage.last_attempt_at < now - timeout),
+        )
+    )
+    stale = list(result.scalars().all())
+    for message in stale:
+        message.status = InboxStatus.FAILED
+        message.metadata_ = {"error": "Classification attempt abandoned (process stopped)"}
+        message.next_attempt_at = now
+    if stale:
+        await session.flush()
+    return stale
+
+
 async def mark_processing(
-    session: AsyncSession, message: InboxMessage
+    session: AsyncSession, message: InboxMessage, *, now: datetime | None = None
 ) -> InboxMessage:
-    """Transition ``new`` or ``failed`` -> ``processing``."""
+    """Transition ``new`` or ``failed`` -> ``processing`` and count the attempt."""
 
     if message.status not in (InboxStatus.NEW, InboxStatus.FAILED):
         raise ValueError(
             f"Invalid status transition: {message.status.value} -> processing"
         )
     message.status = InboxStatus.PROCESSING
+    message.attempt_count = (message.attempt_count or 0) + 1
+    message.last_attempt_at = now or utcnow()
     await session.flush()
     return message
 
@@ -141,6 +199,7 @@ async def mark_processed(
         )
     message.status = InboxStatus.PROCESSED
     message.processed_at = utcnow()
+    message.next_attempt_at = None
     if classification is not None:
         message.classification = classification
     if metadata is not None:
@@ -154,14 +213,16 @@ async def mark_failed(
     message: InboxMessage,
     *,
     error: str | None = None,
+    next_attempt_at: datetime | None = None,
 ) -> InboxMessage:
-    """Transition ``processing`` -> ``failed`` and record the error."""
+    """Transition ``processing`` -> ``failed``; record the error and retry time."""
 
     if message.status is not InboxStatus.PROCESSING:
         raise ValueError(
             f"Invalid status transition: {message.status.value} -> failed"
         )
     message.status = InboxStatus.FAILED
+    message.next_attempt_at = next_attempt_at
     if error is not None:
         message.metadata_ = {"error": error}
     await session.flush()

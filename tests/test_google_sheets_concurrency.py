@@ -162,14 +162,14 @@ def test_startup_jobs_with_invalid_row_do_not_share_connection_concurrently(
     existing = asyncio.run(_create())
     edited = event_to_row(existing)
     edited[1] = "Изменено"
-    edited[2] = "24.08.2025"  # invalid date on an existing record
+    edited[2] = "31.02.2025"  # invalid date on an existing record
     service = ThreadUnsafeService(
         {
             "Events": [
                 list(EVENT_HEADERS),
                 [str(c) for c in edited],
                 ["", "Новая встреча", "2026-12-24", "none", "0", "", ""],
-                ["", "Плохая дата", "24.08.2025", "", "", "", ""],
+                ["", "Плохая дата", "31.02.2025", "", "", "", ""],
             ]
         }
     )
@@ -197,6 +197,6 @@ def test_startup_jobs_with_invalid_row_do_not_share_connection_concurrently(
     assert stored["Как было"].next_date == date(2026, 12, 1)
 
     rows = [r for r in service.sheets["Events"][1:] if any(str(c).strip() for c in r)]
-    assert rows[0][:3] == [str(existing.id), "Изменено", "24.08.2025"]  # kept as typed
+    assert rows[0][:3] == [str(existing.id), "Изменено", "31.02.2025"]  # kept as typed
     assert rows[1][:2] == [stored["Новая встреча"].id, "Новая встреча"]  # got its ID
-    assert rows[2][:3] == ["", "Плохая дата", "24.08.2025"]  # kept as typed
+    assert rows[2][:3] == ["", "Плохая дата", "31.02.2025"]  # kept as typed

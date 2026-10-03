@@ -70,6 +70,18 @@ def test_str_to_date_rejects_invalid():
         str_to_date("2026-13-01")
 
 
+def test_str_to_date_accepts_ru_locale_format():
+    # The production sheet is ru_RU: hand-typed dates come back as DD.MM.YYYY.
+    assert str_to_date("24.08.2025") == date(2025, 8, 24)
+    assert str_to_date(" 01.01.2026 ") == date(2026, 1, 1)
+
+
+@pytest.mark.parametrize("value", ["31.02.2025", "1.8.2025", "24.08.25", "24/08/2025", "08.24.2025"])
+def test_str_to_date_rejects_invalid_or_ambiguous_ru_dates(value):
+    with pytest.raises(ValueError):
+        str_to_date(value)
+
+
 # --- offsets ----------------------------------------------------------------
 
 def test_offsets_roundtrip():
@@ -162,6 +174,7 @@ def _expense(**kwargs):
         category="Софт",
         next_payment_date=date(2026, 10, 15),
         is_active=True,
+        reminder_days_before=3,
     )
     defaults.update(kwargs)
     return RecurringExpense(**defaults)
@@ -169,11 +182,13 @@ def _expense(**kwargs):
 
 def test_expense_to_row():
     row = expense_to_row(_expense())
-    assert row == [1, "Подписка", "12.50", "USD", "monthly", 15, "Софт", "2026-10-15", "да"]
+    assert row == [1, "Подписка", "12.50", "USD", "monthly", 15, "Софт", "2026-10-15", "да", 3]
 
 
 def test_parse_expense_row_full():
-    fields = parse_expense_row([1, "Подписка", "12,50", "usd", "monthly", "15", "Софт", "2026-10-15", "да"])
+    fields = parse_expense_row(
+        [1, "Подписка", "12,50", "usd", "monthly", "15", "Софт", "2026-10-15", "да", "5"]
+    )
     assert fields == {
         "id": 1,
         "name": "Подписка",
@@ -184,6 +199,7 @@ def test_parse_expense_row_full():
         "category": "Софт",
         "next_payment_date": date(2026, 10, 15),
         "is_active": True,
+        "reminder_days_before": 5,
     }
 
 
@@ -207,3 +223,8 @@ def test_parse_expense_row_invalid_payment_day_rejected():
 def test_parse_expense_row_invalid_boolean_rejected():
     with pytest.raises(ValueError):
         parse_expense_row([1, "x", "12.50", "usd", "monthly", "15", "", "", "maybe"])
+
+
+def test_parse_expense_row_negative_reminder_days_rejected():
+    with pytest.raises(ValueError):
+        parse_expense_row([1, "", "", "", "", "", "", "", "", "-1"])

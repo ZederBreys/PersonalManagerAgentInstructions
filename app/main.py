@@ -18,11 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import signal
 import sys
+from pathlib import Path
+from typing import TextIO
 
 from pydantic import ValidationError
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import OperationalError, SQLAlchemyError
 
 from app import __version__
 from app import db
@@ -65,6 +70,45 @@ async def run_startup_recovery(
     return await recover_stale_jobs_and_notify(
         timeout_seconds, telegram=telegram, chat_id=chat_id
     )
+
+
+def alembic_head() -> str | None:
+    """Return the newest migration revision shipped with this code."""
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    root = Path(__file__).resolve().parents[1]
+    if not (root / "alembic.ini").exists():
+        return None
+    config = Config(str(root / "alembic.ini"))
+    config.set_main_option("script_location", str(root / "alembic"))
+    return ScriptDirectory.from_config(config).get_current_head()
+
+
+async def check_schema_is_current() -> None:
+    """Refuse to start on a database that is behind (or ahead of) the code.
+
+    Without this, a deploy that forgot ``alembic upgrade head`` starts fine and
+    then fails inside jobs on missing tables/columns. Databases not managed by
+    Alembic (no ``alembic_version`` table, e.g. test schemas) are not checked.
+    """
+
+    head = alembic_head()
+    if head is None:
+        return
+    try:
+        async with db.get_session() as session:
+            result = await session.execute(text("SELECT version_num FROM alembic_version"))
+            versions = set(result.scalars())
+    except OperationalError:
+        return
+    if versions != {head}:
+        current = ", ".join(sorted(versions)) or "none"
+        raise StartupError(
+            f"database schema is at revision {current}, this code needs {head} "
+            "(run `alembic upgrade head`)"
+        )
 
 
 def build_services(settings: Settings) -> Services:
@@ -156,6 +200,7 @@ async def run(
     running_jobs: set[asyncio.Task] = set()
     poller: asyncio.Task | None = None
     try:
+        await check_schema_is_current()
         try:
             recovered = await run_startup_recovery(
                 settings.job_stale_timeout_seconds,
@@ -234,6 +279,11 @@ def main() -> None:
     logger.info("Configuration loaded (log_level=%s)", settings.log_level)
 
     try:
+        instance_lock = acquire_instance_lock(settings.database_url)
+    except StartupError as exc:
+        logger.critical("Startup failed: %s", exc)
+        sys.exit(1)
+    try:
         asyncio.run(run(settings))
     except StartupError as exc:
         logger.critical("Startup failed: %s", exc)
@@ -243,7 +293,44 @@ def main() -> None:
     except Exception:
         logger.critical("Application crashed", exc_info=True)
         sys.exit(1)
+    finally:
+        if instance_lock is not None:
+            instance_lock.close()  # closing the file releases the OS lock
     logger.info("Application stopped")
+
+
+def acquire_instance_lock(database_url: str) -> TextIO | None:
+    """Ensure only one process runs against this SQLite database.
+
+    Two instances would double every job, fight over Telegram ``getUpdates``
+    (HTTP 409) and race on the outbox. The lock is an OS file lock on
+    ``<database>.lock``: the OS drops it when the process exits or crashes, so
+    a stale lock file never blocks a restart. Returns the open lock file (keep
+    it open while running) or ``None`` for a non-file database.
+    """
+
+    url = make_url(database_url)
+    if url.get_backend_name() != "sqlite" or url.database in (None, "", ":memory:"):
+        return None
+    db.ensure_sqlite_parent_dir(database_url)
+    path = Path(url.database).expanduser().resolve().with_name(Path(url.database).name + ".lock")
+    handle = open(path, "a+")  # noqa: SIM115 - must stay open for the lock's lifetime
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        handle.close()
+        raise StartupError(
+            f"another Personal Manager instance is already running (lock: {path})"
+        ) from exc
+    return handle
 
 
 if __name__ == "__main__":
