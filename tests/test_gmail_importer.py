@@ -426,3 +426,20 @@ def test_non_whitelisted_sender_address_not_logged(
     with caplog.at_level("INFO", logger="app.gmail.importer"):
         asyncio.run(_run())
     assert "private.person@example.com" not in caplog.text
+
+
+def test_spoofed_display_name_is_not_imported(schema: None) -> None:
+    """An allowed address inside the display name must not pass the whitelist,
+    so the message never reaches classification or Telegram notifications."""
+
+    message = _gmail_message("spoof", "unused")
+    message["payload"]["headers"][0]["value"] = "support@liteserver.nl <attacker@evil.example>"
+    client = FakeGmailClient(pages=[MessageList(["spoof"], None)], messages={"spoof": message})
+
+    async def _run() -> None:
+        async with db.get_session() as session:
+            stats = await import_messages(session, client)
+        assert stats.skipped_not_allowed == 1 and stats.imported == 0
+        assert await _rows() == []
+
+    asyncio.run(_run())

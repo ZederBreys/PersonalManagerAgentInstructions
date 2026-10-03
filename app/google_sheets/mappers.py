@@ -28,6 +28,7 @@ EXPENSE_HEADERS = [
     "Категория",
     "Следующая оплата",
     "Активен",
+    "Напомнить за (дн.)",
 ]
 REMINDER_HEADERS = ["ID", "Event ID", "Напомнить", "Выполнено", "Отправлено", "Отправлено в"]
 SETTINGS_HEADERS = ["Параметр", "Значение"]
@@ -55,12 +56,27 @@ def date_to_str(value: date) -> str:
     return value.isoformat()
 
 
+_RU_DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
+
+
 def str_to_date(value: str) -> date:
+    """Parse ``YYYY-MM-DD`` or ``DD.MM.YYYY``.
+
+    The spreadsheet uses the ru_RU locale: a date typed by hand becomes a date
+    cell that Sheets renders (and the API returns as FORMATTED_VALUE) as
+    ``DD.MM.YYYY``. The dotted form is unambiguous, so both are accepted.
+    """
     text = value.strip()
+    match = _RU_DATE_RE.match(text)
     try:
+        if match:
+            day, month, year = (int(part) for part in match.groups())
+            return date(year, month, day)
         return date.fromisoformat(text)
     except ValueError as exc:
-        raise ValueError(f"Invalid date: {value!r} (expected YYYY-MM-DD)") from exc
+        raise ValueError(
+            f"Invalid date: {value!r} (expected YYYY-MM-DD or DD.MM.YYYY)"
+        ) from exc
 
 
 def datetime_to_str(value: datetime) -> str:
@@ -271,6 +287,7 @@ def expense_to_row(expense: RecurringExpense) -> list[object]:
         expense.category or "",
         date_to_str(expense.next_payment_date) if expense.next_payment_date else "",
         bool_to_str(expense.is_active),
+        expense.reminder_days_before,
     ]
 
 
@@ -312,6 +329,13 @@ def parse_expense_row(row: list[object]) -> dict:
     active = _cell_text(row, 8)
     if active is not None:
         fields["is_active"] = str_to_bool(active)
+
+    reminder_days = _cell_text(row, 9)
+    if reminder_days is not None:
+        days = _parse_int(reminder_days, "reminder days")
+        if days < 0:
+            raise ValueError(f"Reminder days must be 0 or more: {reminder_days!r}")
+        fields["reminder_days_before"] = days
 
     return fields
 

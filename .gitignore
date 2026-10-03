@@ -30,9 +30,11 @@ htmlcov/
 .vscode/
 *.swp
 
-# Local runtime data
+# Local runtime data (database, its backups and lock file)
+data/
 *.sqlite
 *.sqlite3
+*.sqlite3.lock
 *.db
 *.log
 

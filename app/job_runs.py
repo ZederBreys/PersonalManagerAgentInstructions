@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import utcnow
@@ -163,3 +163,21 @@ async def mark_notification_sent(session: AsyncSession, run: JobRun) -> JobRun:
         run.notification_sent_at = utcnow()
         await session.flush()
     return run
+
+
+async def prune_finished(
+    session: AsyncSession, *, older_than: timedelta, now: datetime | None = None
+) -> int:
+    """Delete ``success``/``failed`` runs that finished more than ``older_than`` ago.
+
+    ``pending``/``running`` runs are never deleted: they are live state.
+    """
+
+    cutoff = (now or utcnow()) - older_than
+    result = await session.execute(
+        delete(JobRun).where(
+            JobRun.status.in_([JobRunStatus.SUCCESS, JobRunStatus.FAILED]),
+            JobRun.finished_at < cutoff,
+        )
+    )
+    return result.rowcount or 0

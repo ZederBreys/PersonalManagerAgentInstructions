@@ -36,13 +36,20 @@ def save_token(credentials: Any, token_file: str) -> None:
     """Persist credentials to the token file atomically.
 
     The JSON is written to a temporary file next to the target and then moved
-    into place, so a crash mid-write never leaves a truncated token file.
+    into place, so a crash mid-write never leaves a truncated token file. The
+    file holds a refresh token, so it is created owner-only (0600) regardless
+    of the process umask — ``os.replace`` would otherwise give the token file
+    the temp file's default, typically world-readable, permissions.
     """
 
     path = Path(token_file)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = path.with_name(path.name + ".tmp")
-    tmp_path.write_text(credentials.to_json())
+    tmp_path.unlink(missing_ok=True)  # a leftover could carry looser permissions
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(credentials.to_json())
+    os.chmod(tmp_path, 0o600)  # the mode argument is still subject to umask
     os.replace(tmp_path, path)
 
 

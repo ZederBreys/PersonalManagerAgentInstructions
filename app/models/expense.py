@@ -34,6 +34,9 @@ class RecurringExpense(Base):
         ),
         CheckConstraint("currency <> ''", name="ck_recurring_expenses_currency_nonempty"),
         CheckConstraint(
+            "reminder_days_before >= 0", name="ck_recurring_expenses_reminder_days_nonneg"
+        ),
+        CheckConstraint(
             "period IN ('monthly', 'quarterly', 'yearly')",
             name="ck_recurring_expenses_period",
         ),
@@ -58,6 +61,8 @@ class RecurringExpense(Base):
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     next_payment_date: Mapped[date | None] = mapped_column(Date, nullable=True, index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Days before ``next_payment_date`` to send the payment reminder (0 == on the day).
+    reminder_days_before: Mapped[int] = mapped_column(Integer, nullable=False, default=3)
     # One-time key of the Google Sheets row this expense was created from;
     # makes creation from Sheets idempotent (see app.google_sheets.sync).
     sheet_key: Mapped[str | None] = mapped_column(
