@@ -99,7 +99,7 @@ def test_get_values_returns_rows():
     method, kwargs = service.spreadsheets_obj.values_obj.calls[0]
     assert method == "get"
     assert kwargs["spreadsheetId"] == "spreadsheet-id"
-    assert kwargs["range"] == "Events!A1:B2"
+    assert kwargs["range"] == "'Events'!A1:B2"  # the tab title is always quoted
     assert kwargs["valueRenderOption"] == "FORMATTED_VALUE"
 
 
@@ -112,7 +112,7 @@ def test_update_values_calls_update():
     method, kwargs = service.spreadsheets_obj.values_obj.calls[0]
     assert method == "update"
     assert kwargs["spreadsheetId"] == "spreadsheet-id"
-    assert kwargs["range"] == "Events!A1"
+    assert kwargs["range"] == "'Events'!A1"
     assert kwargs["valueInputOption"] == "USER_ENTERED"
     assert kwargs["body"] == {"values": [["ID", "Событие"]]}
 
@@ -137,7 +137,7 @@ def test_clear_calls_clear():
 
     method, kwargs = service.spreadsheets_obj.values_obj.calls[0]
     assert method == "clear"
-    assert kwargs["range"] == "Events"
+    assert kwargs["range"] == "'Events'"
 
 
 def test_get_values_raises_google_sheets_error_on_http_error():

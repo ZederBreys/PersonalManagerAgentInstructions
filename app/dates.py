@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import calendar
-from datetime import date
+from datetime import date, timedelta
 
 from app.models.event import EventRecurrence
 
@@ -53,3 +53,44 @@ def yearly_occurrence(anchor: date, after: date) -> date:
     if candidate < after:
         candidate = _in(after.year + 1)
     return candidate
+
+
+def next_occurrence(
+    recurrence: EventRecurrence, next_date: date, anchor: date | None, today: date
+) -> date | None:
+    """The next time an event happens (``>= today``), or ``None`` if it is over.
+
+    A yearly event always has one (recomputed from its anchor); a one-off event
+    only while its date has not passed.
+    """
+
+    if recurrence is EventRecurrence.YEARLY:
+        return yearly_occurrence(anchor or next_date, today)
+    return next_date if next_date >= today else None
+
+
+def next_reminder_date(
+    recurrence: EventRecurrence,
+    next_date: date,
+    anchor: date | None,
+    offsets: list[int] | tuple[int, ...],
+    today: date,
+) -> date | None:
+    """The date of the next reminder (``>= today``), or ``None`` if none is left.
+
+    Reminders fall ``offset`` days before the event. When every reminder of the
+    coming occurrence has passed, a yearly event looks ahead to the first
+    reminder of the following year.
+    """
+
+    days = list(offsets) or [0]
+    occurrence = next_occurrence(recurrence, next_date, anchor, today)
+    if occurrence is None:
+        return None
+    upcoming = [occurrence - timedelta(days=o) for o in days if occurrence - timedelta(days=o) >= today]
+    if upcoming:
+        return min(upcoming)
+    if recurrence is EventRecurrence.YEARLY:
+        following = yearly_occurrence(anchor or next_date, occurrence + timedelta(days=1))
+        return min(following - timedelta(days=o) for o in days)
+    return None

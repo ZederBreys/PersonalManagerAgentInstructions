@@ -38,6 +38,9 @@ class JobSpec:
     func: JobFunc
     trigger: BaseTrigger
     run_at_startup: bool = False
+    # False for a frequent, cheap watcher job: it must not write a JobRun on
+    # every tick (it triggers real, recorded jobs when there is work to do).
+    track_runs: bool = True
 
 
 def _format_error(exc: BaseException) -> str:
@@ -70,6 +73,7 @@ async def _execute_job(
 
     error: str | None = None
     cancelled = False
+    alert = True
     try:
         await func()
     except asyncio.CancelledError:
@@ -80,6 +84,9 @@ async def _execute_job(
         logger.warning("Job %r cancelled by shutdown", job_name)
     except Exception as exc:  # noqa: BLE001 - the scheduler must survive
         error = _format_error(exc)
+        # An exception can opt out of the Telegram alert (``alert = False``):
+        # the failure is still recorded, e.g. mistakes the user sees in the sheet.
+        alert = getattr(exc, "alert", True)
         logger.exception("Job %r failed", job_name)
 
     async with db.get_session() as session:
@@ -89,7 +96,7 @@ async def _execute_job(
         else:
             await job_runs.succeed_job_run(session, run)
         await session.commit()
-        if error is not None and not cancelled and notifier is not None:
+        if error is not None and not cancelled and alert and notifier is not None:
             await notifier(session, run)
 
 
@@ -144,7 +151,9 @@ def create_scheduler(
 
     scheduler = AsyncIOScheduler(timezone="UTC")
     for spec in DEFAULT_JOBS if jobs is None else jobs:
-        func = wrap_job(spec.name, spec.func, notifier=notifier)
+        func = (
+            wrap_job(spec.name, spec.func, notifier=notifier) if spec.track_runs else spec.func
+        )
         if running is not None:
             func = _track(func, running)
         options = {}

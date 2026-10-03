@@ -11,7 +11,6 @@ deliberately thread-unsafe like the real one: overlapping calls are recorded
 from __future__ import annotations
 
 import asyncio
-import re
 import threading
 import time
 from datetime import date
@@ -22,6 +21,7 @@ from app.google_sheets.client import GoogleSheetsClient
 from app.google_sheets.mappers import EVENT_HEADERS, event_to_row
 from app.jobs import Services, SheetsSyncError, daily_reminders, sheets_sync
 from app.models.event import Event
+from tests.test_google_sheets_two_way import SheetStore
 
 
 class _Request:
@@ -33,15 +33,34 @@ class _Request:
         return self._service.run(self._action)
 
 
+def _plain(range_name: str) -> str:
+    """``'Events'!A2`` -> ``Events!A2`` (the client always quotes the tab title)."""
+
+    title, bang, cells = range_name.rpartition("!")
+    if not bang:
+        title, cells = range_name, ""
+    assert title.startswith("'") and title.endswith("'"), range_name
+    title = title[1:-1].replace("''", "'")
+    return f"{title}!{cells}" if bang else title
+
+
 class ThreadUnsafeService:
-    """Fake Sheets ``service`` that detects concurrent use like a single TLS socket."""
+    """Fake Google service that detects concurrent use like a single TLS socket.
+
+    Speaks the googleapiclient resource-chain API the real client uses; the
+    spreadsheet behind it is the shared in-memory ``SheetStore``.
+    """
 
     def __init__(self, sheets: dict[str, list[list[object]]] | None = None) -> None:
-        self.sheets = {k: [list(r) for r in v] for k, v in (sheets or {}).items()}
+        self.store = SheetStore(sheets)
         self._guard = threading.Lock()
         self._active = 0
         self.max_active = 0
         self.overlaps = 0
+
+    @property
+    def sheets(self) -> dict[str, list[list[object]]]:
+        return self.store.sheets
 
     def run(self, action):
         with self._guard:
@@ -63,50 +82,58 @@ class ThreadUnsafeService:
     def values(self):
         return self
 
+    def developerMetadata(self):  # noqa: N802 - Google's name
+        return self
+
     def get(self, *, spreadsheetId, range=None, fields=None, valueRenderOption=None):
-        if fields is not None:  # spreadsheets().get(...): sheet titles
-            return _Request(self, lambda: {"sheets": [{"properties": {"title": t}} for t in self.sheets]})
-        return _Request(self, lambda: {"values": self._read(range)})
+        if fields is not None:  # spreadsheets().get(...): the tabs
+            return _Request(
+                self,
+                lambda: {
+                    "sheets": [
+                        {"properties": {"sheetId": info.sheet_id, "title": info.title}}
+                        for info in self.store.sheets_sync()
+                    ]
+                },
+            )
+        return _Request(self, lambda: {"values": self.store._rows(_plain(range))})
+
+    def batchGet(self, *, spreadsheetId, ranges, valueRenderOption=None):  # noqa: N802
+        return _Request(
+            self,
+            lambda: {"valueRanges": [{"values": self.store._rows(_plain(r))} for r in ranges]},
+        )
 
     def update(self, *, spreadsheetId, range, valueInputOption, body):
-        return _Request(self, lambda: self._write(range, body["values"]))
+        assert valueInputOption == "USER_ENTERED"
+        return _Request(self, lambda: self.store.update_sync(_plain(range), body["values"]))
 
     def clear(self, *, spreadsheetId, range, body):
-        return _Request(self, lambda: self._clear(range))
+        return _Request(self, lambda: self.store.clear_sync(_plain(range)))
 
-    def batchUpdate(self, *, spreadsheetId, body):
-        def add() -> None:
+    def search(self, *, spreadsheetId, body):
+        def found() -> dict:
+            return {
+                "matchedDeveloperMetadata": [
+                    {"developerMetadata": {"metadataValue": role, "location": {"sheetId": sid}}}
+                    for sid, role in self.store.roles_sync().items()
+                ]
+            }
+
+        return _Request(self, found)
+
+    def batchUpdate(self, *, spreadsheetId, body):  # noqa: N802
+        def apply() -> None:
             for request in body["requests"]:
-                self.sheets.setdefault(request["addSheet"]["properties"]["title"], [])
+                if "addSheet" in request:
+                    self.store.add_sheet_sync(request["addSheet"]["properties"]["title"])
+                elif "createDeveloperMetadata" in request:
+                    metadata = request["createDeveloperMetadata"]["developerMetadata"]
+                    self.store.tag_sync(metadata["location"]["sheetId"], metadata["metadataValue"])
+                else:
+                    self.store.batch_update_sync([request])
 
-        return _Request(self, add)
-
-    def _read(self, range_name: str) -> list[list[object]]:
-        name, _, cells = range_name.partition("!")
-        rows = [list(r) for r in self.sheets.get(name, [])]
-        while rows and not any(str(c).strip() for c in rows[-1]):
-            rows.pop()
-        return rows[:1] if cells == "1:1" else rows
-
-    def _write(self, range_name: str, values: list[list[object]]) -> None:
-        name, _, cells = range_name.partition("!")
-        start = int(re.fullmatch(r"A(\d+)", cells).group(1)) - 1 if cells else 0
-        rows = self.sheets.setdefault(name, [])
-        for i, row in enumerate(values):
-            while len(rows) <= start + i:
-                rows.append([])
-            target = rows[start + i]
-            for j, value in enumerate(row):
-                while len(target) <= j:
-                    target.append("")
-                target[j] = value
-
-    def _clear(self, range_name: str) -> None:
-        name, _, cells = range_name.partition("!")
-        first, last = (int(n) for n in re.findall(r"\d+", cells))
-        rows = self.sheets.get(name, [])
-        for index in range(first - 1, min(last, len(rows))):
-            rows[index] = []
+        return _Request(self, apply)
 
 
 def _client(service: ThreadUnsafeService) -> GoogleSheetsClient:
@@ -120,7 +147,7 @@ def test_fake_service_detects_unserialized_concurrent_use() -> None:
 
     async def _run() -> None:
         calls = [
-            asyncio.to_thread(service.values().get(spreadsheetId="x", range="Events").execute)
+            asyncio.to_thread(service.values().get(spreadsheetId="x", range="'Events'").execute)
             for _ in range(8)
         ]
         await asyncio.gather(*calls)

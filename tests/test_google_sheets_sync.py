@@ -52,7 +52,7 @@ class FakeClient:
 
 # --- export -----------------------------------------------------------------
 
-def test_export_events_writes_headers_and_rows(schema: None) -> None:
+def test_export_events_writes_data_rows_only(schema: None) -> None:
     async def _run() -> None:
         async with db.get_session() as session:
             e1 = await events.create_event(session, name="A", next_date=date(2026, 11, 1))
@@ -64,11 +64,15 @@ def test_export_events_writes_headers_and_rows(schema: None) -> None:
             await export_events(session, client)
 
         assert client.cleared == []
-        assert client.updates["Events"] == [
-            EVENT_HEADERS,
+        # Only data rows, from A2: the header row is the user's (renamable).
+        assert list(client.updates) == ["Events!A2"]
+        rows = client.updates["Events!A2"]
+        assert [r[:7] for r in rows] == [
             [e2.id, "B", "2026-10-01", "none", "0", "", "нет"],
             [e1.id, "A", "2026-11-01", "none", "0", "", "да"],
         ]
+        assert all(len(r) == len(EVENT_HEADERS) for r in rows)
+        assert rows[0][7:] == ["", ""]  # paused: nothing is coming
 
     asyncio.run(_run())
 
@@ -78,7 +82,7 @@ def test_export_events_empty_dataset(schema: None) -> None:
         async with db.get_session() as session:
             client = FakeClient()
             await export_events(session, client)
-        assert client.updates["Events"] == [EVENT_HEADERS]
+        assert client.updates == {}  # nothing to write, and the header is never written
 
     asyncio.run(_run())
 
@@ -100,8 +104,7 @@ def test_export_expenses_writes_rows(schema: None) -> None:
             await export_expenses(session, client)
 
         assert client.cleared == []
-        assert client.updates["Expenses"] == [
-            EXPENSE_HEADERS,
+        assert client.updates["Expenses!A2"] == [
             [exp.id, "Netflix", 12.99, "USD", "monthly", 1, "", "2026-10-01", "да", 3],
         ]
 
@@ -118,8 +121,7 @@ def test_export_reminders_writes_rows(schema: None) -> None:
             client = FakeClient()
             await export_reminders(session, client)
 
-        assert client.updates["Reminders"] == [
-            REMINDER_HEADERS,
+        assert client.updates["Reminders!A2"] == [
             [rems[0].id, e.id, "2026-10-15", "нет", "нет", ""],
         ]
 
@@ -328,7 +330,10 @@ def test_import_expenses_invalid_money_leaves_db_unchanged(schema: None) -> None
 
 # --- export: safe overwrite (R1) --------------------------------------------
 
-def test_export_events_clears_stale_tail_when_old_has_more_rows(schema: None) -> None:
+def test_export_events_keeps_blank_rows_in_place(schema: None) -> None:
+    """Blank rows are not compacted: notes the user keeps to the right of the
+    table must stay next to their record, so no row may shift."""
+
     async def _run() -> None:
         async with db.get_session() as session:
             e = await events.create_event(session, name="A", next_date=date(2026, 10, 1))
@@ -337,17 +342,41 @@ def test_export_events_clears_stale_tail_when_old_has_more_rows(schema: None) ->
         async with db.get_session() as session:
             old = [
                 EVENT_HEADERS,
-                [str(e.id), "Old1", "2026-01-01", "none", "0", "", "да"],
-                ["", "", "", "", "", "", ""],
+                [str(e.id), "Old1", "2026-01-01", "none", "0", "", "да", "", "", "my note"],
+                [],
+                ["", "Unknown row", "x", "", "", "", "", "", "", "other note"],
             ]
             client = FakeClient({"Events": old})
             await export_events(session, client)
 
-        assert client.updates["Events"] == [
-            EVENT_HEADERS,
+        rows = client.updates["Events!A2"]
+        assert [r[:7] for r in rows] == [
             [e.id, "A", "2026-10-01", "none", "0", "", "да"],
+            [""] * 7,  # the blank row keeps its place
+            ["", "Unknown row", "x", "", "", "", ""],
         ]
-        assert client.cleared == ["Events!A3:G3"]
+        # The table is columns A..I; the notes in J and beyond are never written.
+        assert all(len(r) == len(EVENT_HEADERS) for r in rows)
+        assert client.cleared == []
+
+    asyncio.run(_run())
+
+
+def test_export_reminders_clears_stale_tail_when_old_has_more_rows(schema: None) -> None:
+    async def _run() -> None:
+        async with db.get_session() as session:
+            e = await events.create_event(session, name="A", next_date=date(2026, 10, 1))
+            [r] = await reminders.generate_reminders(session, e)
+            await session.commit()
+
+        async with db.get_session() as session:
+            old = [REMINDER_HEADERS, ["1", "1", "2026-01-01", "нет", "нет", ""],
+                   ["2", "1", "2026-01-02", "нет", "нет", ""], ["3", "1", "2026-01-03", "нет", "нет", ""]]
+            client = FakeClient({"Reminders": old})
+            await export_reminders(session, client)
+
+        assert client.updates["Reminders!A2"] == [[r.id, e.id, "2026-10-01", "нет", "нет", ""]]
+        assert client.cleared == ["Reminders!A3:F4"]
 
     asyncio.run(_run())
 
@@ -371,20 +400,15 @@ def test_export_clear_failure_keeps_newly_written_data(schema: None) -> None:
     async def _run() -> None:
         async with db.get_session() as session:
             e = await events.create_event(session, name="A", next_date=date(2026, 10, 1))
+            [r] = await reminders.generate_reminders(session, e)
             await session.commit()
-            old = [
-                EVENT_HEADERS,
-                [str(e.id), "Old1", "2026-01-01", "none", "0", "", "да"],
-                ["", "", "", "", "", "", ""],
-            ]
-            client = FakeClient({"Events": old}, fail_clear=True)
+            old = [REMINDER_HEADERS, ["1", "1", "2026-01-01", "нет", "нет", ""],
+                   ["2", "1", "2026-01-02", "нет", "нет", ""]]
+            client = FakeClient({"Reminders": old}, fail_clear=True)
             with pytest.raises(GoogleSheetsError):
-                await export_events(session, client)
+                await export_reminders(session, client)
 
-        assert client.updates["Events"] == [
-            EVENT_HEADERS,
-            [e.id, "A", "2026-10-01", "none", "0", "", "да"],
-        ]
+        assert client.updates["Reminders!A2"] == [[r.id, e.id, "2026-10-01", "нет", "нет", ""]]
 
     asyncio.run(_run())
 
@@ -524,7 +548,7 @@ def test_export_then_import_roundtrip(schema: None) -> None:
         async with db.get_session() as session:
             client = FakeClient()
             await export_expenses(session, client)
-            rows = client.updates["Expenses"]
+            rows = [EXPENSE_HEADERS, *client.updates["Expenses!A2"]]
 
         async with db.get_session() as session:
             client = FakeClient({"Expenses": rows})

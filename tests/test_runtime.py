@@ -37,6 +37,7 @@ from app.notifications import make_streak_failure_notifier
 from app.scheduler import CANCELLED_ERROR, JobSpec, _execute_job, create_scheduler
 from app.telegram import bot
 from app.telegram.client import TelegramAPIError
+from tests.test_google_sheets_two_way import SheetStore
 
 CHAT_ID = 4242
 NIGHT = datetime(2026, 10, 3, 2, 0, tzinfo=timezone.utc)
@@ -73,34 +74,7 @@ class FakeTelegram:
         self.closed = True
 
 
-class FakeSheets:
-    """In-memory Google Sheets supporting what ensure_workbook/sync use."""
-
-    def __init__(self, sheets: dict[str, list[list[object]]] | None = None) -> None:
-        self.sheets = sheets or {}
-        self.updates: list[str] = []
-
-    async def get_sheet_titles(self) -> list[str]:
-        return list(self.sheets)
-
-    async def add_sheet(self, title: str) -> None:
-        self.sheets.setdefault(title, [])
-
-    async def get_values(self, range_name: str) -> list[list[object]]:
-        name, _, cells = range_name.partition("!")
-        rows = self.sheets.get(name, [])
-        return rows[:1] if cells == "1:1" else rows
-
-    async def update_values(self, range_name: str, values: list[list[object]]) -> None:
-        name, _, cells = range_name.partition("!")
-        self.updates.append(name)
-        if cells == "A1":
-            self.sheets[name] = [list(values[0]), *self.sheets.get(name, [])[1:]]
-        else:
-            self.sheets[name] = [list(row) for row in values]
-
-    async def clear(self, range_name: str) -> None:
-        return None
+FakeSheets = SheetStore  # the shared stateful in-memory spreadsheet
 
 
 def _settings(**values) -> Settings:
@@ -149,11 +123,16 @@ def test_build_jobs_with_all_integrations() -> None:
         "health_check",
         "daily_reminders",
         "sheets_sync",
+        "sheets_poll",
         "gmail_import",
         "inbox_classification",
     }
     assert jobs["sheets_sync"].run_at_startup
     assert jobs["gmail_import"].run_at_startup
+    # The watcher runs every few seconds and must not write a JobRun each time.
+    assert jobs["sheets_poll"].track_runs is False
+    assert jobs["sheets_poll"].trigger.interval.total_seconds() == 5
+    assert all(j.track_runs for name, j in jobs.items() if name != "sheets_poll")
 
 
 def test_daily_reminders_runs_at_startup_only_in_daytime() -> None:
@@ -191,7 +170,7 @@ def test_run_lifecycle_polls_telegram_runs_jobs_and_cleans_up(
         task = asyncio.create_task(main_module.run(services.settings, stop=stop, services=services))
         # Telegram polling answered, and the startup sheets_sync job really ran.
         await _wait_for(lambda: telegram.sent)
-        await _wait_for(lambda: "Events" in sheets.sheets and "Reminders" in sheets.updates)
+        await _wait_for(lambda: len(sheets.roles) == 6)  # every sheet found/created and marked
         stop.set()
         await task
         assert _other_tasks() == []
@@ -505,7 +484,9 @@ def test_daily_reminders_survive_telegram_outage(schema: None) -> None:
         past = today - timedelta(days=2)
         event_id = await _create_event(name="ДР", next_date=past, recurrence="yearly")
         async with db.get_session() as session:
-            await reminders.generate_reminders(session, await session.get(Event, event_id))
+            created = await reminders.generate_reminders(session, await session.get(Event, event_id))
+            for reminder in created:  # created in time, then missed while the app was down
+                reminder.created_at = datetime(2026, 9, 1)
             await session.commit()
         await daily_reminders(services, today=today)  # no Telegram needed to queue
         await deliver_notifications(services)
@@ -526,7 +507,9 @@ def test_daily_reminders_advances_yearly_event_after_queueing(schema: None) -> N
             name="Годовщина", next_date=date(2026, 10, 1), recurrence="yearly"
         )
         async with db.get_session() as session:
-            await reminders.generate_reminders(session, await session.get(Event, event_id))
+            created = await reminders.generate_reminders(session, await session.get(Event, event_id))
+            for reminder in created:  # created in time, then missed while the app was down
+                reminder.created_at = datetime(2026, 9, 1)
             await session.commit()
         await daily_reminders(services, today=today)
         assert (await _event(event_id)).next_date == date(2027, 10, 1)
@@ -578,7 +561,6 @@ def test_sheets_sync_keeps_invalid_rows_untouched(schema: None) -> None:
         asyncio.run(sheets_sync(services))
     assert sheets.sheets["Events"][1][:2] == ["not-an-id", "x"]  # user's row preserved
     assert not any(sheets.sheets["Events"][1][2:])  # only padded with empty cells
-    assert "Reminders" in sheets.updates
 
 
 # --- failure alerts -----------------------------------------------------------------

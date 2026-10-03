@@ -16,3 +16,7 @@ def setup_logging(level: str = "INFO") -> None:
         format=_LOG_FORMAT,
         datefmt=_DATE_FORMAT,
     )
+    # APScheduler logs "Running job ..." / "executed successfully" at INFO for
+    # every execution; with a job every few seconds that would bury the journal.
+    # Skipped runs and errors (WARNING and above) are still logged.
+    logging.getLogger("apscheduler.executors.default").setLevel(logging.WARNING)

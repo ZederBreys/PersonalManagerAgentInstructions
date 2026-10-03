@@ -83,12 +83,23 @@ def payment_reminder_due(expense: RecurringExpense, today: date) -> bool:
 
 
 async def queue_event_reminders(session: AsyncSession, today: date) -> int:
-    """Queue due reminders of active events and mark them sent (handed to the outbox)."""
+    """Queue due reminders of active events and mark them sent (handed to the outbox).
+
+    A reminder that was created only after its own day had passed, for an event
+    whose date has passed too, is stale: it is what you get when an event is
+    entered with a date in the past (e.g. a yearly event typed with last
+    August's date). It is closed silently instead of sending "уже прошло".
+    A reminder that was created in time and merely missed while the app was
+    down is still sent late.
+    """
 
     queued = 0
     for reminder in await reminders.get_due_reminders(session, today=today):
         event = await session.get(Event, reminder.event_id)
         if event is None or not event.is_active:
+            continue
+        if event.next_date < today and reminder.created_at.date() > reminder.remind_at:
+            await reminders.mark_done(session, reminder)
             continue
         await _queue_event_reminder(session, reminder, event, today)
         queued += 1
