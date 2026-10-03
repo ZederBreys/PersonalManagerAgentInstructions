@@ -76,8 +76,9 @@ JOB_RUN_RETENTION = timedelta(days=30)
 
 # Cheap change detection for the sheets: one read every few seconds; a real sync
 # runs only after the user's edits have stopped changing between two reads.
-SYNC_REQUEST_COOLDOWN = 30.0  # seconds before a new sync may be requested
+SYNC_REQUEST_TIMEOUT = 120.0  # a requested sync that never started is requested again
 POLL_PAUSE_AFTER_ERROR = 30.0  # seconds to back off after a Sheets API error
+POLL_PAUSE_BAD_RANGE = 10.0  # a renamed tab (HTTP 400): look the tabs up again soon
 
 
 class SheetsSyncError(RuntimeError):
@@ -110,6 +111,7 @@ class Services:
     poll_applied: SheetSnapshot | None = None  # what the last sync left in the sheet
     poll_seen: SheetSnapshot | None = None  # what the previous poll saw
     poll_pause_until: float = 0.0  # time.monotonic() before which polling is paused
+    sync_pending: bool = False  # a sync was requested and has not started yet
     sync_requested_at: float = float("-inf")
     request_sync: Callable[[], None] | None = None  # set by the application: run a sync now
 
@@ -175,7 +177,10 @@ _SHEET_IMPORTERS = ((ROLE_EVENTS, import_events), (ROLE_EXPENSES, import_expense
 
 
 async def _import_from_sheets(
-    session: AsyncSession, sheets: GoogleSheetsClient, layout: SheetLayout
+    session: AsyncSession,
+    sheets: GoogleSheetsClient,
+    layout: SheetLayout,
+    snapshots: dict[str, list[list[object]]] | None = None,
 ) -> tuple[dict[str, list[SheetValidationError]], dict[str, list[RowReport]]]:
     """Apply user rows from Sheets (create/update/delete) and commit.
 
@@ -188,7 +193,10 @@ async def _import_from_sheets(
     for role, importer in _SHEET_IMPORTERS:
         ref = layout[role]
         rows: list[RowReport] = []
-        errors = await importer(session, sheets, sheet=ref.title, reports=rows)
+        snapshot: list[list[object]] = []
+        errors = await importer(session, sheets, sheet=ref.title, reports=rows, snapshot=snapshot)
+        if snapshots is not None:
+            snapshots[role] = snapshot
         await session.commit()
         reports[role] = rows
         if errors:
@@ -202,8 +210,13 @@ async def _export_to_sheets(
     layout: SheetLayout,
     problems: dict[str, list[SheetValidationError]],
     reports: dict[str, list[RowReport]],
+    snapshots: dict[str, list[list[object]]] | None = None,
 ) -> None:
-    """Merge the canonical state into Sheets; rows that failed import stay as typed."""
+    """Merge the canonical state into Sheets; rows that failed import stay as typed.
+
+    ``snapshots`` are the rows the import read: a row the user edited since then
+    is not overwritten (the next sync picks the edit up).
+    """
 
     def preserved(role: str) -> set:
         return {e.key for e in problems.get(layout[role].title, []) if e.key is not None}
@@ -213,11 +226,11 @@ async def _export_to_sheets(
 
     await export_events(
         session, sheets, preserve=preserved(ROLE_EVENTS), sheet=layout[ROLE_EVENTS].title,
-        blank_rows=deleted(ROLE_EVENTS),
+        blank_rows=deleted(ROLE_EVENTS), import_snapshot=(snapshots or {}).get(ROLE_EVENTS),
     )
     await export_expenses(
         session, sheets, preserve=preserved(ROLE_EXPENSES), sheet=layout[ROLE_EXPENSES].title,
-        blank_rows=deleted(ROLE_EXPENSES),
+        blank_rows=deleted(ROLE_EXPENSES), import_snapshot=(snapshots or {}).get(ROLE_EXPENSES),
     )
     await export_reminders(session, sheets, sheet=layout[ROLE_REMINDERS].title)
 
@@ -238,10 +251,11 @@ async def _roundtrip(
     assert sheets is not None
     layout = await ensure_workbook(sheets)
     services.sheet_layout = layout
-    problems, reports = await _import_from_sheets(session, sheets, layout)
+    snapshots: dict[str, list[list[object]]] = {}
+    problems, reports = await _import_from_sheets(session, sheets, layout, snapshots)
     if between is not None:
         await between()
-    await _export_to_sheets(session, sheets, layout, problems, reports)
+    await _export_to_sheets(session, sheets, layout, problems, reports, snapshots)
     try:
         await apply_feedback(session, sheets, layout, reports)
     except GoogleSheetsError as exc:  # cosmetic: never fail the sync because of it
@@ -289,25 +303,47 @@ async def _snapshot(services: Services) -> SheetSnapshot:
     return tuple(tuple(tuple(str(cell) for cell in row) for row in rows) for rows in values)
 
 
-async def _remember_sheet_state(services: Services) -> None:
-    """After a sync: what is in the sheet now needs no further sync."""
+async def _try_snapshot(services: Services) -> SheetSnapshot | None:
+    """The sheet right now, or ``None`` when it cannot be read (yet)."""
+
+    if services.sheet_layout is None:
+        return None
+    try:
+        return await _snapshot(services)
+    except GoogleSheetsError:
+        return None
+
+
+async def _remember_sheet_state(services: Services, before: SheetSnapshot | None) -> None:
+    """After a sync: decide whether the sheet still needs another pass.
+
+    ``before`` is the sheet as it was when the sync started. If it is identical
+    to the sheet now, the sync changed nothing and nobody edited during it: the
+    state is the baseline. If it differs, the sync wrote something (an ID, a
+    canonical value) or — importantly — the user edited while it ran; either
+    way no baseline is claimed, so the watcher runs one more (usually trivial)
+    pass instead of losing an edit made during the sync.
+    """
 
     try:
-        snapshot = await _snapshot(services)
+        after = await _snapshot(services)
     except GoogleSheetsError as exc:
         logger.warning("Could not read the sheet state after the sync: %s", exc.message)
         services.poll_applied = None
         return
-    services.poll_applied = services.poll_seen = snapshot
+    services.poll_applied = after if before == after else None
+    services.poll_seen = after
 
 
 async def sheets_sync(services: Services) -> None:
     """Resolve the sheets, import user edits, export the state, mark each row."""
 
     assert services.sheets is not None
+    services.sync_pending = False  # the watcher may request the next one right away
     async with services.data_lock, db.get_session() as session:
+        before = await _try_snapshot(services)
         problems = await _roundtrip(services, session)
-        await _remember_sheet_state(services)
+        await _remember_sheet_state(services, before)
     _raise_for_sheet_errors(problems)
 
 
@@ -330,8 +366,9 @@ async def sheets_poll(services: Services) -> None:
     except GoogleSheetsError as exc:
         # E.g. a tab was renamed (the cached title is stale) or the quota is hit.
         services.sheet_layout = None
-        services.poll_pause_until = now + POLL_PAUSE_AFTER_ERROR
-        logger.warning("Sheet poll failed (%s); retrying in %.0fs", exc.message, POLL_PAUSE_AFTER_ERROR)
+        pause = POLL_PAUSE_BAD_RANGE if exc.http_status == 400 else POLL_PAUSE_AFTER_ERROR
+        services.poll_pause_until = now + pause
+        logger.warning("Sheet poll failed (%s); retrying in %.0fs", exc.message, pause)
         return
 
     if snapshot == services.poll_applied:
@@ -340,8 +377,11 @@ async def sheets_poll(services: Services) -> None:
     if snapshot != services.poll_seen:
         services.poll_seen = snapshot  # still being edited: wait for the next poll
         return
-    if now - services.sync_requested_at < SYNC_REQUEST_COOLDOWN or services.request_sync is None:
+    if services.request_sync is None:
         return
+    if services.sync_pending and now - services.sync_requested_at < SYNC_REQUEST_TIMEOUT:
+        return  # already requested, the scheduler is about to start it
+    services.sync_pending = True
     services.sync_requested_at = now
     logger.info("Sheet edits detected; syncing")
     services.request_sync()
@@ -403,8 +443,9 @@ async def daily_reminders(services: Services, today: date | None = None) -> None
         if services.sheets is None:
             await _daily_work(session, today)
         else:
+            before = await _try_snapshot(services)
             problems = await _roundtrip(services, session, between=partial(_daily_work, session, today))
-            await _remember_sheet_state(services)
+            await _remember_sheet_state(services, before)
     _raise_for_sheet_errors(problems)
 
 

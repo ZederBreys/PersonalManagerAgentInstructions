@@ -341,7 +341,13 @@ def _watched(store) -> tuple[Services, list[int]]:
     services = _services(store)
     requested: list[int] = []
     services.request_sync = lambda: requested.append(1)
-    _run(sheets_sync(services))  # the baseline: what the sheet looks like after a sync
+    # The first sync writes IDs/notes (the sheet changes), so it claims no baseline;
+    # the next one finds nothing to change and does.
+    for _ in range(3):
+        _run(sheets_sync(services))
+        if services.poll_applied is not None:
+            break
+    assert services.poll_applied is not None
     return services, requested
 
 
@@ -371,8 +377,26 @@ def test_poll_requests_a_sync_only_after_edits_settle(schema: None, clock: _Cloc
     assert requested == []
     _poll(services)  # unchanged since the previous poll -> settled
     assert requested == [1]
-    _poll(services)  # the cooldown prevents a second request while the sync is pending
+    _poll(services)  # a request is already pending: no second one
     assert requested == [1]
+    _run(sheets_sync(services))  # the sync starts and finishes ...
+    store.sheets["Events"][1][1] = "Ещё правка"  # ... and the user edits again right away
+    _poll(services, 2)
+    assert requested == [1, 1]  # no waiting period: the next request goes out as soon as it settles
+
+
+def test_a_lost_sync_request_is_repeated_after_the_timeout(schema: None, clock: _Clock) -> None:
+    store = _store(EVENTS, EVENT_ROW)
+    services, requested = _watched(store)
+    store.sheets["Events"][1][1] = "Правка"
+    _poll(services, 2)
+    assert requested == [1]
+    clock.now += 60
+    _poll(services)
+    assert requested == [1]  # still pending (the scheduler may just be busy)
+    clock.now += 70  # the request is older than the timeout: it must have been lost
+    _poll(services)
+    assert requested == [1, 1]
 
 
 def test_after_the_sync_the_new_state_is_the_baseline(schema: None, clock: _Clock) -> None:
@@ -524,6 +548,7 @@ def test_daily_reminders_also_refreshes_the_sheet_and_baseline(schema: None) -> 
     _run(daily_reminders(services, today=date(2026, 10, 3)))
     assert str(store.sheets["Events"][1][0]) == "1"  # imported, and the ID written back
     assert store.colour("Events", 2) == GREEN
+    _run(daily_reminders(services, today=date(2026, 10, 3)))  # the second pass changes nothing
     assert services.poll_applied is not None  # the watcher will not re-sync this state
 
 

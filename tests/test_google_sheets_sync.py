@@ -35,7 +35,7 @@ class FakeClient:
         self.fail_update = fail_update
         self.fail_clear = fail_clear
 
-    async def get_values(self, range_name: str) -> list[list[object]]:
+    async def get_values(self, range_name: str, *, raw: bool = False) -> list[list[object]]:
         name = range_name.split("!")[0]
         return self.sheets.get(name, [])
 
@@ -352,8 +352,8 @@ def test_export_events_keeps_blank_rows_in_place(schema: None) -> None:
         rows = client.updates["Events!A2"]
         assert [r[:7] for r in rows] == [
             [e.id, "A", "2026-10-01", "none", "0", "", "да"],
-            [""] * 7,  # the blank row keeps its place
-            ["", "Unknown row", "x", "", "", "", ""],
+            [None] * 7,  # the blank row keeps its place and is not written (null is skipped)
+            [None] * 7,  # a row that is not ours is never rewritten either
         ]
         # The table is columns A..I; the notes in J and beyond are never written.
         assert all(len(r) == len(EVENT_HEADERS) for r in rows)

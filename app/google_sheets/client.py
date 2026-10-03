@@ -67,6 +67,9 @@ _VALUE_INPUT_OPTION = "USER_ENTERED"
 # type: a date cell comes back as "24.08.2025" in a ru_RU sheet, a number as
 # "12,5". The mappers accept those display forms.
 _VALUE_RENDER_OPTION = "FORMATTED_VALUE"
+# The underlying values: numbers stay numbers, dates are serial numbers, whatever
+# number format the user gave the cell. Used where the displayed text is unreliable.
+_VALUE_RENDER_RAW = "UNFORMATTED_VALUE"
 
 
 class GoogleSheetsError(Exception):
@@ -145,12 +148,16 @@ class GoogleSheetsClient:
             self._service = _build_service(self._service_account_file)
         return self._service
 
-    async def get_values(self, range_name: str) -> list[list[object]]:
-        """Read a range; return the list of rows (no header interpretation)."""
+    async def get_values(self, range_name: str, *, raw: bool = False) -> list[list[object]]:
+        """Read a range; return the list of rows (no header interpretation).
 
-        return await self._call(self._get_values, range_name)
+        By default cells come back as displayed text; ``raw=True`` returns the
+        underlying values instead (see ``_VALUE_RENDER_RAW``).
+        """
 
-    def _get_values(self, range_name: str) -> list[list[object]]:
+        return await self._call(self._get_values, range_name, raw)
+
+    def _get_values(self, range_name: str, raw: bool = False) -> list[list[object]]:
         from googleapiclient.errors import HttpError
 
         try:
@@ -161,7 +168,7 @@ class GoogleSheetsClient:
                 .get(
                     spreadsheetId=self._spreadsheet_id,
                     range=_quote_range(range_name),
-                    valueRenderOption=_VALUE_RENDER_OPTION,
+                    valueRenderOption=_VALUE_RENDER_RAW if raw else _VALUE_RENDER_OPTION,
                 )
                 .execute()
             )

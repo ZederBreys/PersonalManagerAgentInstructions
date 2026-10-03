@@ -96,6 +96,10 @@ allowed. The bot overwrites your own colours and notes in the `ID` column.
 | Reorder columns or insert a column inside the table | no — the column order is fixed |
 | Write your own notes to the right of the table | yes: from column `J` in Events, from `K` in Expenses (`H` and `I` in Events are filled by the bot) |
 | Insert blank rows, sort | yes |
+| Your own date or amount format (e.g. a long weekday date, `2 500 ₽`) | yes — the bot reads the stored value, not what is displayed |
+| An amount whose cell format hides the value (e.g. `12.5` shown as a date) | the row is rejected with an explanation in the note; reset the format (Format → Number → Automatic) and retype the amount |
+| A checkbox in the "Активно" column | yes — it stays a checkbox; the bot does not replace it with a word |
+| A row holding only your own note (no ID, name, etc.) | ignored, not an error; rows that are not the bot's are never rewritten |
 | Delete a row | does not delete the record: the row comes back. To delete a record write the word `удалить` (any letter case) in the "Активно" column — the record is deleted with its reminders and the row is cleared |
 
 **Events** — `Событие` (name) and `Дата` (date) are required:

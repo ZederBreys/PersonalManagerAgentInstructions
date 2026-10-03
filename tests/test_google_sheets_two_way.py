@@ -54,6 +54,9 @@ class SheetStore:
         self.requests = {"read": 0, "write": 0}
         self.fail_full_write = False
         self.fail_batch_update = False
+        # (title, 0-based row, column) -> text shown instead of the value on formatted
+        # reads: a custom number/date format hides the real value, like in Sheets
+        self.display: dict[tuple[str, int, int], str] = {}
         self.on_read = None  # optional hook(store, range_name) called on every get_values
 
     # --- tabs -------------------------------------------------------------------
@@ -108,11 +111,15 @@ class SheetStore:
     def _column(letter: str) -> int:
         return ord(letter) - ord("A")
 
-    def _rows(self, range_name: str) -> list[list[object]]:
+    def _rows(self, range_name: str, raw: bool = False) -> list[list[object]]:
         name, _, cells = range_name.partition("!")
         if name not in self.sheets:
             raise GoogleSheetsError(message=f"Unable to parse range: {range_name}", http_status=400)
         rows = [list(r) for r in self.sheets[name]]
+        if not raw:
+            for (title, r, c), text in self.display.items():
+                if title == name and r < len(rows) and c < len(rows[r]):
+                    rows[r][c] = text
         match = re.fullmatch(r"([A-Z]):([A-Z])", cells)
         if match:  # whole columns, e.g. A:I
             last = self._column(match.group(2)) + 1
@@ -121,11 +128,11 @@ class SheetStore:
             rows.pop()  # the API omits trailing empty rows
         return rows[:1] if cells == "1:1" else rows
 
-    async def get_values(self, range_name: str) -> list[list[object]]:
+    async def get_values(self, range_name: str, *, raw: bool = False) -> list[list[object]]:
         if self.on_read is not None:
             self.on_read(self, range_name)
         self.requests["read"] += 1
-        return self._rows(range_name)
+        return self._rows(range_name, raw)
 
     async def batch_get(self, ranges) -> list[list[list[object]]]:
         self.requests["read"] += 1
@@ -154,6 +161,8 @@ class SheetStore:
         start_col, start_row = self._column(match.group(1)), int(match.group(2)) - 1
         for i, row in enumerate(values):
             for j, value in enumerate(row):
+                if value is None:
+                    continue  # the API skips null values: the cell stays as it is
                 if isinstance(value, str) and value.startswith("'"):
                     value = value[1:]  # USER_ENTERED: the apostrophe forces text and is consumed
                 self._set(name, start_row + i, start_col + j, value)

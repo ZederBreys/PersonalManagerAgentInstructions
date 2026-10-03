@@ -286,7 +286,7 @@ def test_notes_right_of_the_table_stay_next_to_their_record(schema: None) -> Non
     _sync(store)
 
     rows = store.sheets["Events"]
-    assert [r[1] for r in rows[1:]] == ["Первое", "", "Второе"]  # nothing shifted
+    assert [r[1] if len(r) > 1 else "" for r in rows[1:]] == ["Первое", "", "Второе"]  # nothing shifted
     assert [r[9] if len(r) > 9 else "" for r in rows[1:]] == ["заметка 1", "", "заметка 2"]
     assert len(_records(EVENTS)) == 2
 

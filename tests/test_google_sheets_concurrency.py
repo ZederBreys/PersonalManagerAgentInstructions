@@ -96,7 +96,8 @@ class ThreadUnsafeService:
                     ]
                 },
             )
-        return _Request(self, lambda: {"values": self.store._rows(_plain(range))})
+        raw = valueRenderOption == "UNFORMATTED_VALUE"
+        return _Request(self, lambda: {"values": self.store._rows(_plain(range), raw)})
 
     def batchGet(self, *, spreadsheetId, ranges, valueRenderOption=None):  # noqa: N802
         return _Request(
