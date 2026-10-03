@@ -8,10 +8,14 @@ of APScheduler's own in-memory state.
 
 from __future__ import annotations
 
+import asyncio
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.base import BaseTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +26,18 @@ logger = logging.getLogger(__name__)
 
 JobFunc = Callable[[], Awaitable[None]]
 JobNotifier = Callable[[AsyncSession, JobRun], Awaitable[None]]
+
+CANCELLED_ERROR = "Job cancelled by application shutdown"
+
+
+@dataclass(frozen=True)
+class JobSpec:
+    """A job to register: its name, body, trigger and whether to run at startup."""
+
+    name: str
+    func: JobFunc
+    trigger: BaseTrigger
+    run_at_startup: bool = False
 
 
 def _format_error(exc: BaseException) -> str:
@@ -41,6 +57,9 @@ async def _execute_job(
     is recorded and logged but never re-raised, so a single failing job cannot
     crash the scheduler. On failure, an optional ``notifier`` is invoked after
     the ``failed`` state is committed.
+
+    A job cancelled during shutdown is recorded as ``failed`` (instead of being
+    left ``running``) and is not notified: stopping the service is expected.
     """
 
     async with db.get_session() as session:
@@ -50,8 +69,15 @@ async def _execute_job(
         run_id = run.id
 
     error: str | None = None
+    cancelled = False
     try:
         await func()
+    except asyncio.CancelledError:
+        # Only the shutdown path cancels job tasks. Record the outcome and end
+        # the task normally so APScheduler does not log it as a crash.
+        cancelled = True
+        error = CANCELLED_ERROR
+        logger.warning("Job %r cancelled by shutdown", job_name)
     except Exception as exc:  # noqa: BLE001 - the scheduler must survive
         error = _format_error(exc)
         logger.exception("Job %r failed", job_name)
@@ -63,7 +89,7 @@ async def _execute_job(
         else:
             await job_runs.succeed_job_run(session, run)
         await session.commit()
-        if error is not None and notifier is not None:
+        if error is not None and not cancelled and notifier is not None:
             await notifier(session, run)
 
 
@@ -78,24 +104,61 @@ def wrap_job(
     return wrapped
 
 
+def _track(func: JobFunc, running: set[asyncio.Task]) -> JobFunc:
+    """Register the job's task in ``running`` while it executes (for shutdown)."""
+
+    async def tracked() -> None:
+        task = asyncio.current_task()
+        if task is not None:
+            running.add(task)
+        try:
+            await func()
+        finally:
+            if task is not None:
+                running.discard(task)
+
+    return tracked
+
+
 async def health_check() -> None:
     """Demo job body: a no-op that proves the scheduler pipeline works."""
 
     logger.info("health_check: ok")
 
 
-def create_scheduler(notifier: JobNotifier | None = None) -> AsyncIOScheduler:
-    """Create and configure the async scheduler with the demo ``health_check`` job."""
+DEFAULT_JOBS = (JobSpec("health_check", health_check, IntervalTrigger(minutes=15, timezone="UTC")),)
+
+
+def create_scheduler(
+    notifier: JobNotifier | None = None,
+    *,
+    jobs: Sequence[JobSpec] | None = None,
+    running: set[asyncio.Task] | None = None,
+) -> AsyncIOScheduler:
+    """Create the async scheduler and register ``jobs`` (default: ``health_check``).
+
+    Every job runs at most once at a time (``max_instances=1``) and missed runs
+    are coalesced into one. When ``running`` is given, the tasks of executing
+    jobs are tracked in it so shutdown can wait for them to finish.
+    """
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
-        wrap_job("health_check", health_check, notifier=notifier),
-        trigger=IntervalTrigger(minutes=15),
-        id="health_check",
-        name="health_check",
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=60,
-        replace_existing=True,
-    )
+    for spec in DEFAULT_JOBS if jobs is None else jobs:
+        func = wrap_job(spec.name, spec.func, notifier=notifier)
+        if running is not None:
+            func = _track(func, running)
+        options = {}
+        if spec.run_at_startup:
+            options["next_run_time"] = datetime.now(timezone.utc)
+        scheduler.add_job(
+            func,
+            trigger=spec.trigger,
+            id=spec.name,
+            name=spec.name,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=60,
+            replace_existing=True,
+            **options,
+        )
     return scheduler

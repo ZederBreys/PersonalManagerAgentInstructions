@@ -13,7 +13,7 @@ services are used only as auxiliary channels.
 - **Recurring expenses** — monthly/quarterly/yearly; amounts stored as integer minor units (cents), next-payment-date calculation.
 - **Job tracking** — a `job_runs` table (pending/running/success/failed), stale-job detection and startup recovery.
 - **Telegram notifications** — only important events (job failed, job interrupted).
-- **Google Sheets** — human-facing interface: export/import of events, expenses and reminders.
+- **Google Sheets** — human-facing interface: two-way sync of events and expenses (a new row with an empty ID creates a record and receives its ID; deleting a row deletes nothing), reminders export.
 - **Inbox + DeepSeek classification** — category, importance, summary, "action required" flag.
 - **Gmail** — read-only import of messages from whitelisted senders (exact address match).
 
@@ -78,7 +78,7 @@ to the repository.
 ## External integrations
 
 - **Telegram** — push notifications only (job failed/interrupted) via the Bot API (httpx).
-- **Google Sheets** — export/import via a service account; import validates all rows before writing to the database.
+- **Google Sheets** — sync via a service account; every row is validated on its own, invalid rows are skipped and never overwritten by export.
 - **Gmail** — read-only import of messages from whitelisted senders (`support@liteserver.nl`, `admin@ztv.su`), exact address match.
 - **DeepSeek** — semantic classification of incoming messages.
 
@@ -98,8 +98,11 @@ alembic downgrade base   # roll back all migrations
 python -m app
 ```
 
-A single pass: load configuration, set up logging, recover stale jobs (with a
-Telegram notification when configured), then exit.
+One long-lived process (for systemd): recovers stale jobs, starts the scheduler
+(health check, daily reminders and — when configured — Google Sheets sync, Gmail
+import, inbox classification) and Telegram long polling. Runs until
+SIGTERM/SIGINT, then shuts down gracefully. Exit code 1 means it could not start
+(e.g. migrations not applied), 2 means invalid configuration.
 
 One-time Gmail authorization (opens a browser for the OAuth consent screen):
 

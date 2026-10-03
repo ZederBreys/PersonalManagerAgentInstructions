@@ -9,6 +9,8 @@ the only path that mutates state.
 
 from __future__ import annotations
 
+import re
+import secrets
 from datetime import date, datetime
 
 from app.models.event import Event, EventRecurrence
@@ -151,6 +153,61 @@ def _cell_text(row: list[object], index: int) -> str | None:
     return text or None
 
 
+# --- row identity ------------------------------------------------------------
+
+# A new row is first stamped with a one-time pending key in its ID cell; the
+# record is then created with the same ``sheet_key``. If the process stops
+# before the real ID is exported, the next sync finds the record by this key
+# instead of creating a duplicate.
+_PENDING_KEY_PREFIX = "new-"
+_PENDING_KEY_RE = re.compile(r"^new-[0-9a-f]{12}$")
+
+
+def new_pending_key() -> str:
+    return _PENDING_KEY_PREFIX + secrets.token_hex(6)
+
+
+def parse_row_key(row: list[object]) -> int | str | None:
+    """Return the row's identity: an int ID, a pending key, or ``None`` (new row).
+
+    Raises ``ValueError`` for anything else in the ID cell.
+    """
+
+    raw = _cell_text(row, 0)
+    if raw is None:
+        return None
+    if _PENDING_KEY_RE.match(raw):
+        return raw
+    return _parse_int(raw, "ID")
+
+
+def _require(fields: dict, labels: dict[str, str]) -> None:
+    missing = [label for name, label in labels.items() if name not in fields]
+    if missing:
+        raise ValueError("Required for a new row: " + ", ".join(missing))
+
+
+def require_new_event_fields(fields: dict) -> None:
+    """Raise ``ValueError`` unless ``fields`` can create a new event."""
+
+    _require(fields, {"name": EVENT_HEADERS[1], "next_date": EVENT_HEADERS[2]})
+
+
+def require_new_expense_fields(fields: dict) -> None:
+    """Raise ``ValueError`` unless ``fields`` can create a new expense."""
+
+    _require(
+        fields,
+        {
+            "name": EXPENSE_HEADERS[1],
+            "amount_minor": EXPENSE_HEADERS[2],
+            "currency": EXPENSE_HEADERS[3],
+            "payment_day": EXPENSE_HEADERS[5],
+            "next_payment_date": EXPENSE_HEADERS[7],
+        },
+    )
+
+
 # --- Events ----------------------------------------------------------------
 
 def event_to_row(event: Event) -> list[object]:
@@ -166,15 +223,13 @@ def event_to_row(event: Event) -> list[object]:
 
 
 def parse_event_row(row: list[object]) -> dict:
-    """Parse a sheet row into ``{"id": int, **update fields}``.
+    """Parse a sheet row into ``{"id": <row key>, **fields}``.
 
-    Empty cells are treated as "leave unchanged" and omitted from the result.
-    Raises ``ValueError`` for any invalid value.
+    ``id`` is an int ID, a pending key or ``None`` for a new row (see
+    :func:`parse_row_key`). Empty cells are treated as "leave unchanged" and
+    omitted from the result. Raises ``ValueError`` for any invalid value.
     """
-    id_raw = _cell_text(row, 0)
-    if id_raw is None:
-        raise ValueError("ID is empty")
-    fields: dict = {"id": _parse_int(id_raw, "ID")}
+    fields: dict = {"id": parse_row_key(row)}
 
     name = _cell_text(row, 1)
     if name is not None:
@@ -220,11 +275,8 @@ def expense_to_row(expense: RecurringExpense) -> list[object]:
 
 
 def parse_expense_row(row: list[object]) -> dict:
-    """Parse a sheet row into ``{"id": int, **update fields}`` (see parse_event_row)."""
-    id_raw = _cell_text(row, 0)
-    if id_raw is None:
-        raise ValueError("ID is empty")
-    fields: dict = {"id": _parse_int(id_raw, "ID")}
+    """Parse a sheet row into ``{"id": <row key>, **fields}`` (see parse_event_row)."""
+    fields: dict = {"id": parse_row_key(row)}
 
     name = _cell_text(row, 1)
     if name is not None:
