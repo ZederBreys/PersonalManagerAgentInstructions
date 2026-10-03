@@ -177,8 +177,8 @@ async def sheets_sync(services: Services) -> None:
 
     sheets = services.sheets
     assert sheets is not None
-    await ensure_workbook(sheets)
     async with services.data_lock, db.get_session() as session:
+        await ensure_workbook(sheets)
         problems = await _import_from_sheets(session, sheets)
         await _export_to_sheets(session, sheets, problems)
     _raise_for_sheet_errors(problems)

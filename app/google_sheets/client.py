@@ -4,6 +4,12 @@ The official ``google-api-python-client`` is synchronous, so every API call is
 offloaded to a worker thread via :func:`asyncio.to_thread` to keep the asyncio
 event loop (and therefore the scheduler) responsive.
 
+Thread safety: the underlying ``httplib2.Http`` (one TLS connection) is not
+thread-safe. Two worker threads using it at once make OpenSSL read the same
+connection concurrently, which corrupts native memory (``free(): corrupted
+unsorted chunks``, segfaults, hangs). Every call of a client instance is
+therefore serialized with a lock, so jobs may share one client safely.
+
 Security: the service-account credentials and spreadsheet id are never logged;
 API errors are reported by message and HTTP status only, never by URL or
 credentials content.
@@ -12,9 +18,13 @@ credentials content.
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+import threading
+from collections.abc import Callable
+from typing import Any, TypeVar
 
 from app.config import Settings
+
+_T = TypeVar("_T")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Write values as-is (no Sheets auto-typing), so round-trips stay predictable:
@@ -85,6 +95,17 @@ class GoogleSheetsClient:
         self._service_account_file = service_account_file
         self._spreadsheet_id = spreadsheet_id
         self._service = service
+        # Serializes service creation and every request (see module docstring).
+        self._lock = threading.Lock()
+
+    async def _call(self, func: Callable[..., _T], *args: Any) -> _T:
+        """Run a blocking API call in a worker thread, one call at a time."""
+
+        def locked() -> _T:
+            with self._lock:
+                return func(*args)
+
+        return await asyncio.to_thread(locked)
 
     def _get_service(self) -> Any:
         if self._service is None:
@@ -94,7 +115,7 @@ class GoogleSheetsClient:
     async def get_values(self, range_name: str) -> list[list[object]]:
         """Read a range; return the list of rows (no header interpretation)."""
 
-        return await asyncio.to_thread(self._get_values, range_name)
+        return await self._call(self._get_values, range_name)
 
     def _get_values(self, range_name: str) -> list[list[object]]:
         from googleapiclient.errors import HttpError
@@ -120,7 +141,7 @@ class GoogleSheetsClient:
     async def update_values(self, range_name: str, values: list[list[object]]) -> None:
         """Overwrite a range with ``values``."""
 
-        await asyncio.to_thread(self._update_values, range_name, values)
+        await self._call(self._update_values, range_name, values)
 
     def _update_values(self, range_name: str, values: list[list[object]]) -> None:
         from googleapiclient.errors import HttpError
@@ -140,7 +161,7 @@ class GoogleSheetsClient:
     async def append_values(self, range_name: str, values: list[list[object]]) -> None:
         """Append rows after the existing content of ``range_name``."""
 
-        await asyncio.to_thread(self._append_values, range_name, values)
+        await self._call(self._append_values, range_name, values)
 
     def _append_values(self, range_name: str, values: list[list[object]]) -> None:
         from googleapiclient.errors import HttpError
@@ -161,7 +182,7 @@ class GoogleSheetsClient:
     async def clear(self, range_name: str) -> None:
         """Clear the contents of ``range_name``."""
 
-        await asyncio.to_thread(self._clear, range_name)
+        await self._call(self._clear, range_name)
 
     def _clear(self, range_name: str) -> None:
         from googleapiclient.errors import HttpError
@@ -178,7 +199,7 @@ class GoogleSheetsClient:
     async def get_sheet_titles(self) -> list[str]:
         """Return the titles of the existing sheets, in spreadsheet order."""
 
-        return await asyncio.to_thread(self._get_sheet_titles)
+        return await self._call(self._get_sheet_titles)
 
     def _get_sheet_titles(self) -> list[str]:
         from googleapiclient.errors import HttpError
@@ -202,7 +223,7 @@ class GoogleSheetsClient:
     async def add_sheet(self, title: str) -> None:
         """Create a new sheet with the given ``title`` (idempotent by caller)."""
 
-        await asyncio.to_thread(self._add_sheet, title)
+        await self._call(self._add_sheet, title)
 
     def _add_sheet(self, title: str) -> None:
         from googleapiclient.errors import HttpError
