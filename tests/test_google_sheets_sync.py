@@ -102,7 +102,7 @@ def test_export_expenses_writes_rows(schema: None) -> None:
         assert client.cleared == []
         assert client.updates["Expenses"] == [
             EXPENSE_HEADERS,
-            [exp.id, "Netflix", "12.99", "USD", "monthly", 1, "", "2026-10-01", "да", 3],
+            [exp.id, "Netflix", 12.99, "USD", "monthly", 1, "", "2026-10-01", "да", 3],
         ]
 
     asyncio.run(_run())

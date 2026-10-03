@@ -41,10 +41,10 @@ def test_main_starts_and_stops_cleanly(schema: None, monkeypatch: pytest.MonkeyP
 
     real_run = main_module.run
 
-    async def run_then_stop(settings: Settings) -> None:
+    async def run_then_stop(settings: Settings, **kwargs) -> None:
         stop = asyncio.Event()
         asyncio.get_running_loop().call_later(0.2, stop.set)
-        await real_run(settings, stop=stop)
+        await real_run(settings, stop=stop, **kwargs)
 
     monkeypatch.setattr(main_module, "run", run_then_stop)
     monkeypatch.setattr(main_module, "get_settings", lambda: Settings(_env_file=None))

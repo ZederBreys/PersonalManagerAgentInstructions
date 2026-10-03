@@ -169,13 +169,27 @@ async def _export_to_sheets(
     await export_reminders(session, sheets)
 
 
+MAX_REPORTED_ROW_ERRORS = 5
+
+
 def _raise_for_sheet_errors(problems: dict[str, list[SheetValidationError]]) -> None:
-    if problems:
-        summary = ", ".join(f"{sheet} ({len(errors)})" for sheet, errors in problems.items())
-        raise SheetsSyncError(
-            f"Invalid rows in sheet(s) {summary}; they were skipped and left as typed. "
-            "Fix them in Google Sheets (details in the application log)"
-        )
+    """Fail the job with the row-level reasons, so the alert says what to fix.
+
+    The message becomes ``JobRun.error`` and therefore the Telegram alert and
+    ``/status``: it lists the first few rows with the reason for each.
+    """
+
+    if not problems:
+        return
+    details = [f"{sheet}: {error}" for sheet, errors in problems.items() for error in errors]
+    shown = details[:MAX_REPORTED_ROW_ERRORS]
+    if len(details) > len(shown):
+        shown.append(f"... and {len(details) - len(shown)} more")
+    raise SheetsSyncError(
+        "Invalid rows were skipped and left as typed in the sheet:\n"
+        + "\n".join(shown)
+        + "\nFix them in Google Sheets; valid rows are imported anyway."
+    )
 
 
 async def sheets_sync(services: Services) -> None:

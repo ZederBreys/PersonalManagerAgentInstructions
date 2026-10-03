@@ -182,7 +182,7 @@ def _expense(**kwargs):
 
 def test_expense_to_row():
     row = expense_to_row(_expense())
-    assert row == [1, "Подписка", "12.50", "USD", "monthly", 15, "Софт", "2026-10-15", "да", 3]
+    assert row == [1, "Подписка", 12.5, "USD", "monthly", 15, "Софт", "2026-10-15", "да", 3]
 
 
 def test_parse_expense_row_full():

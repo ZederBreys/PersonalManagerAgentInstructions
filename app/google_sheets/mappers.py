@@ -43,13 +43,19 @@ def bool_to_str(value: bool) -> str:
     return _TRUE if value else _FALSE
 
 
+# Everything a person (or a checkbox) might write for yes/no. Checkbox cells
+# are read back as "TRUE"/"FALSE" ("ИСТИНА"/"ЛОЖЬ" in a ru_RU sheet).
+_TRUE_WORDS = {"да", "д", "yes", "y", "true", "истина", "1", "+", "вкл", "активен", "активно"}
+_FALSE_WORDS = {"нет", "н", "no", "n", "false", "ложь", "0", "-", "выкл", "неактивен", "неактивно"}
+
+
 def str_to_bool(value: str) -> bool:
     normalized = value.strip().lower()
-    if normalized == _TRUE:
+    if normalized in _TRUE_WORDS:
         return True
-    if normalized == _FALSE:
+    if normalized in _FALSE_WORDS:
         return False
-    raise ValueError(f"Invalid boolean: {value!r} (expected '{_TRUE}' or '{_FALSE}')")
+    raise ValueError(f"Invalid yes/no value: {value!r} (expected '{_TRUE}' or '{_FALSE}')")
 
 
 def date_to_str(value: date) -> str:
@@ -89,13 +95,24 @@ def minor_to_display(amount_minor: int) -> str:
     return f"{whole}.{fraction:02d}"
 
 
-def display_to_minor(value: str) -> int:
-    """Strictly parse a display amount ("12.50" or "12,50") to minor units.
+def minor_to_number(amount_minor: int) -> int | float:
+    """Minor units -> a real number for the sheet (so Sheets stores a number cell).
 
-    Rejects ambiguous inputs (e.g. "1,234.56") and anything with more than two
-    decimal places. Stays in integer arithmetic throughout.
+    A whole amount is an int; otherwise the exact two-decimal float (its JSON
+    form is the short, exact decimal, e.g. 1299 -> 12.99).
     """
-    text = value.strip()
+    whole, fraction = divmod(amount_minor, 100)
+    return whole if fraction == 0 else amount_minor / 100
+
+
+def display_to_minor(value: str) -> int:
+    """Strictly parse a display amount ("12.50", "12,50", "1 000,50") to minor units.
+
+    Spaces (including the non-breaking ones Sheets uses as thousands
+    separators) are ignored. Rejects ambiguous inputs (e.g. "1,234.56") and
+    anything with more than two decimal places. Stays in integer arithmetic.
+    """
+    text = "".join(value.split())
     if not text:
         raise ValueError("Amount is empty")
     if "," in text and "." in text:
@@ -136,18 +153,59 @@ def str_to_offsets(value: str) -> list[int]:
     return sorted(set(values))
 
 
+_RECURRENCE_WORDS = {
+    EventRecurrence.NONE: {"none", "нет", "разово", "однократно", "один раз", "once", "no", "-", "не повторять"},
+    EventRecurrence.YEARLY: {
+        "yearly", "ежегодно", "ежегодный", "каждый год", "раз в год", "год", "annual", "annually",
+    },
+}
+_PERIOD_WORDS = {
+    ExpensePeriod.MONTHLY: {
+        "monthly", "ежемесячно", "ежемесячный", "месяц", "в месяц", "раз в месяц", "каждый месяц", "month",
+    },
+    ExpensePeriod.QUARTERLY: {
+        "quarterly", "ежеквартально", "ежеквартальный", "квартал", "раз в квартал", "каждый квартал", "quarter",
+    },
+    ExpensePeriod.YEARLY: {
+        "yearly", "ежегодно", "ежегодный", "год", "в год", "раз в год", "каждый год", "year", "annual", "annually",
+    },
+}
+_CURRENCY_WORDS = {
+    "RUB": {"₽", "р", "р.", "руб", "руб.", "рубль", "рубля", "рублей"},
+    "USD": {"$", "долл", "долл.", "доллар", "доллара", "долларов"},
+    "EUR": {"€", "евро"},
+}
+
+
+def _lookup(words_by_value: dict, value: str):
+    normalized = " ".join(value.strip().lower().split())
+    for result, words in words_by_value.items():
+        if normalized in words:
+            return result
+    return None
+
+
 def _recurrence(value: str) -> EventRecurrence:
-    try:
-        return EventRecurrence(value.strip().lower())
-    except ValueError as exc:
-        raise ValueError(f"Invalid recurrence: {value!r}") from exc
+    found = _lookup(_RECURRENCE_WORDS, value)
+    if found is None:
+        raise ValueError(
+            f"Invalid recurrence: {value!r} (expected 'none' = one-off or 'yearly' = every year)"
+        )
+    return found
 
 
 def _period(value: str) -> ExpensePeriod:
-    try:
-        return ExpensePeriod(value.strip().lower())
-    except ValueError as exc:
-        raise ValueError(f"Invalid period: {value!r}") from exc
+    found = _lookup(_PERIOD_WORDS, value)
+    if found is None:
+        raise ValueError(
+            f"Invalid period: {value!r} (expected 'monthly', 'quarterly' or 'yearly')"
+        )
+    return found
+
+
+def _currency(value: str) -> str:
+    """Map symbols/words (₽, руб, $, евро) to ISO codes; anything else is kept."""
+    return _lookup(_CURRENCY_WORDS, value) or value
 
 
 def _parse_int(value: str, label: str) -> int:
@@ -167,6 +225,18 @@ def _cell_text(row: list[object], index: int) -> str | None:
         return None
     text = str(raw).strip()
     return text or None
+
+
+# --- values written to the sheet -----------------------------------------------------
+
+# Sheets parses written values like typed ones. Free text that would be taken
+# for a formula (=, +, -, @) or a number/date/time ("2026", "1/2", "12:30")
+# gets a leading apostrophe, which Sheets consumes: the cell stays text.
+_NEEDS_TEXT_PREFIX_RE = re.compile(r"^[\s=+\-@]|^[\d\s.,:/+\-]+$")
+
+
+def text_cell(value: str) -> str:
+    return "'" + value if value and _NEEDS_TEXT_PREFIX_RE.search(value) else value
 
 
 # --- row identity ------------------------------------------------------------
@@ -229,11 +299,11 @@ def require_new_expense_fields(fields: dict) -> None:
 def event_to_row(event: Event) -> list[object]:
     return [
         event.id,
-        event.name,
+        text_cell(event.name),
         date_to_str(event.next_date),
         event.recurrence.value,
         offsets_to_str(event.reminder_offsets or [0]),
-        event.action_text or "",
+        text_cell(event.action_text or ""),
         bool_to_str(event.is_active),
     ]
 
@@ -279,12 +349,12 @@ def parse_event_row(row: list[object]) -> dict:
 def expense_to_row(expense: RecurringExpense) -> list[object]:
     return [
         expense.id,
-        expense.name,
-        minor_to_display(expense.amount_minor),
+        text_cell(expense.name),
+        minor_to_number(expense.amount_minor),
         expense.currency,
         expense.period.value,
         expense.payment_day,
-        expense.category or "",
+        text_cell(expense.category or ""),
         date_to_str(expense.next_payment_date) if expense.next_payment_date else "",
         bool_to_str(expense.is_active),
         expense.reminder_days_before,
@@ -305,7 +375,7 @@ def parse_expense_row(row: list[object]) -> dict:
 
     currency = _cell_text(row, 3)
     if currency is not None:
-        fields["currency"] = currency
+        fields["currency"] = _currency(currency)
 
     period = _cell_text(row, 4)
     if period is not None:

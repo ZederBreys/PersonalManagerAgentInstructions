@@ -113,7 +113,7 @@ def test_update_values_calls_update():
     assert method == "update"
     assert kwargs["spreadsheetId"] == "spreadsheet-id"
     assert kwargs["range"] == "Events!A1"
-    assert kwargs["valueInputOption"] == "RAW"
+    assert kwargs["valueInputOption"] == "USER_ENTERED"
     assert kwargs["body"] == {"values": [["ID", "Событие"]]}
 
 
