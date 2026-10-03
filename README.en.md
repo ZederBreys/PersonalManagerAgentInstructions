@@ -75,6 +75,38 @@ and the corresponding integration is simply disabled.
 point to external credential files; the files themselves must never be committed
 to the repository.
 
+## Filling in the Google Sheet
+
+The `Events` and `Expenses` sheets are for entering and editing data. Do not touch the header row or
+reorder columns. New record: fill in a row and **leave the `ID` column empty**; the next sync (every
+30 minutes) creates the record and writes its number into `ID`. Deleting a row deletes nothing in the
+database. A row with an error is skipped and left as typed while the other rows are imported; the
+reasons arrive in Telegram and show in `/status`.
+
+**Events** — `Событие` (name) and `Дата` (date) are required:
+
+| Column | What to write |
+|---|---|
+| Дата | `24.12.2026` or `2026-12-24` |
+| Повтор | `none` / `разово` — once; `yearly` / `ежегодно` — every year |
+| Напоминание | days before to remind, comma-separated: `0` (on the day), `3`, `0, 15` |
+| Что сделать | any text |
+| Статус | `да` / `нет` (or a checkbox) — whether the event is active |
+
+**Expenses** — `Название`, `Сумма`, `Валюта`, `День оплаты`, `Следующая оплата` are required:
+
+| Column | What to write |
+|---|---|
+| Сумма | `1000`, `12,50`, `1 000,50` |
+| Валюта | `RUB`, `USD`, `EUR` (or `₽`, `$`, `€`, `руб`) |
+| Период | `monthly` / `ежемесячно`, `quarterly` / `ежеквартально`, `yearly` / `ежегодно` (empty = monthly) |
+| День оплаты | a number from 1 to 31 |
+| Следующая оплата | a date, as in Events |
+| Активен | `да` / `нет` (or a checkbox) |
+| Напомнить за (дн.) | days before to remind about the payment (empty = 3) |
+
+An empty cell when editing an existing row means "leave unchanged".
+
 ## External integrations
 
 - **Telegram** — push notifications only (job failed/interrupted) via the Bot API (httpx).

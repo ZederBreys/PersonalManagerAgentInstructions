@@ -27,12 +27,16 @@ from app.config import Settings
 _T = TypeVar("_T")
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-# Write values as-is (no Sheets auto-typing), so round-trips stay predictable:
-# our mappers are the only thing that interprets dates, booleans and money.
-_VALUE_INPUT_OPTION = "RAW"
-# Read values back as strings (the sheet's display format). This keeps the
-# mapping layer in control: dates stay ISO text, amounts stay "12.50" strings,
-# booleans stay "да"/"нет" text, so the mappers never have to guess a type.
+# Write values as if the user typed them. With RAW, every value we wrote back
+# (including the user's own cells, which are read as display strings) became
+# plain text: dates and numbers turned into text and Sheets showed a leading
+# apostrophe on them. Our exports send real numbers for numbers and ISO dates
+# (which Sheets turns into date cells); free text that could be misread as a
+# number, date or formula is protected explicitly (see mappers.text_cell).
+_VALUE_INPUT_OPTION = "USER_ENTERED"
+# Read values back as strings (the sheet's display format), whatever the cell
+# type: a date cell comes back as "24.08.2025" in a ru_RU sheet, a number as
+# "12,5". The mappers accept those display forms.
 _VALUE_RENDER_OPTION = "FORMATTED_VALUE"
 
 

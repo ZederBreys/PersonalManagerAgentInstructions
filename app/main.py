@@ -190,8 +190,16 @@ async def run(
     *,
     stop: asyncio.Event | None = None,
     services: Services | None = None,
+    exclusive: bool = False,
 ) -> None:
-    """Run the application until ``stop`` is set (by SIGTERM/SIGINT by default)."""
+    """Run the application until ``stop`` is set (by SIGTERM/SIGINT by default).
+
+    ``exclusive`` means the caller holds the single-instance lock, so no other
+    process can be running a job: at startup every job still marked ``running``
+    belongs to a previous process that died, and is closed immediately instead
+    of waiting for ``job_stale_timeout_seconds`` (which only matters for a job
+    that hangs inside a live process, handled by the ``health_check`` job).
+    """
 
     stop = stop or asyncio.Event()
     previous_handlers = _install_signal_handlers(stop)
@@ -203,7 +211,7 @@ async def run(
         await check_schema_is_current()
         try:
             recovered = await run_startup_recovery(
-                settings.job_stale_timeout_seconds,
+                0 if exclusive else settings.job_stale_timeout_seconds,
                 telegram=services.telegram,
                 chat_id=services.chat_id,
             )
@@ -284,7 +292,7 @@ def main() -> None:
         logger.critical("Startup failed: %s", exc)
         sys.exit(1)
     try:
-        asyncio.run(run(settings))
+        asyncio.run(run(settings, exclusive=instance_lock is not None))
     except StartupError as exc:
         logger.critical("Startup failed: %s", exc)
         sys.exit(1)

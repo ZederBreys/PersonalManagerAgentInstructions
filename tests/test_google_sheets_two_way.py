@@ -68,6 +68,8 @@ class SheetStore:
             raise GoogleSheetsError(message="write failed")
         for i, row in enumerate(values):
             for j, value in enumerate(row):
+                if isinstance(value, str) and value.startswith("'"):
+                    value = value[1:]  # USER_ENTERED: the apostrophe forces text and is consumed
                 self._set(name, start + i, j, value)
 
     async def clear(self, range_name: str) -> None:
