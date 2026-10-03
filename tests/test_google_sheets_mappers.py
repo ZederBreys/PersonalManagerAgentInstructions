@@ -116,8 +116,23 @@ def _event(**kwargs):
 
 
 def test_event_to_row():
-    row = event_to_row(_event())
-    assert row == [1, "День рождения", "2026-10-15", "yearly", "0, 15", "Позвонить", "да"]
+    # Columns H and I are filled by the bot: the next reminder and the next
+    # occurrence. On 2026-10-01 the 15-days-before reminder (30.09) has passed.
+    row = event_to_row(_event(), today=date(2026, 10, 1))
+    assert row == [
+        1, "День рождения", "2026-10-15", "yearly", "0, 15", "Позвонить", "да",
+        "15.10.2026", "15.10.2026",
+    ]
+
+
+def test_event_to_row_bot_columns():
+    yearly = _event(next_date=date(2026, 8, 24), reminder_offsets=[7])
+    assert event_to_row(yearly, today=date(2026, 10, 3))[7:] == ["17.08.2027", "24.08.2027"]
+    assert event_to_row(yearly, today=date(2026, 8, 20))[7:] == ["17.08.2027", "24.08.2026"]  # looks ahead
+    one_off = _event(next_date=date(2026, 12, 24), recurrence=EventRecurrence.NONE, reminder_offsets=[3])
+    assert event_to_row(one_off, today=date(2026, 10, 3))[7:] == ["21.12.2026", "24.12.2026"]
+    assert event_to_row(one_off, today=date(2027, 1, 1))[7:] == ["", ""]  # over
+    assert event_to_row(_event(is_active=False), today=date(2026, 10, 1))[7:] == ["", ""]  # paused
 
 
 def test_parse_event_row_full():

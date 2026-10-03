@@ -26,29 +26,119 @@ from app.models.expense import RecurringExpense
 _PENDING = re.compile(r"^new-[0-9a-f]{12}$")
 
 
+def trim(row: list) -> list:
+    """A row without its trailing empty cells (the API drops them when reading)."""
+    cells = list(row)
+    while cells and not str(cells[-1]).strip():
+        cells.pop()
+    return cells
+
+
 class SheetStore:
-    """In-memory spreadsheet with real-API write semantics."""
+    """In-memory spreadsheet with the real API's semantics.
+
+    Values (``update`` only touches the cells it is given; a leading apostrophe
+    forces text and is consumed), tabs with stable ids that survive renaming,
+    hidden role markers, and the notes/colours written with ``batch_update``.
+    """
 
     def __init__(self, sheets: dict[str, list[list[object]]] | None = None) -> None:
         self.sheets = {name: [list(r) for r in rows] for name, rows in (sheets or {}).items()}
+        self._ids = {name: number for number, name in enumerate(self.sheets, start=1)}
+        self._next_id = len(self._ids) + 1
+        self.roles: dict[int, str] = {}
+        self.notes: dict[tuple[int, int], str] = {}  # (sheet id, row) -> note
+        self.colours: dict[tuple[int, int], dict] = {}
+        self.updates: list[str] = []  # titles of the sheets that were written to
+        self.batch_requests: list[dict] = []
+        self.requests = {"read": 0, "write": 0}
         self.fail_full_write = False
-        self.on_read = None  # optional hook(store, range_name) called on every read
+        self.fail_batch_update = False
+        # (title, 0-based row, column) -> text shown instead of the value on formatted
+        # reads: a custom number/date format hides the real value, like in Sheets
+        self.display: dict[tuple[str, int, int], str] = {}
+        self.on_read = None  # optional hook(store, range_name) called on every get_values
+
+    # --- tabs -------------------------------------------------------------------
+    # The ``*_sync`` methods hold the logic (a test double of the Google service
+    # calls them from worker threads); the async ones are the client interface.
+    def sheets_sync(self):
+        from app.google_sheets.client import SheetInfo
+
+        self.requests["read"] += 1
+        return [SheetInfo(self._ids[name], name) for name in self.sheets]
+
+    def roles_sync(self) -> dict[int, str]:
+        self.requests["read"] += 1
+        return dict(self.roles)
+
+    def tag_sync(self, sheet_id: int, role: str) -> None:
+        self.requests["write"] += 1
+        self.roles[sheet_id] = role
+
+    def add_sheet_sync(self, title: str) -> None:
+        assert title not in self.sheets, "Sheets rejects duplicate tab titles"
+        self.requests["write"] += 1
+        self.sheets[title] = []
+        self._ids[title] = self._next_id
+        self._next_id += 1
+
+    async def get_sheets(self):
+        return self.sheets_sync()
 
     async def get_sheet_titles(self) -> list[str]:
         return list(self.sheets)
 
-    async def add_sheet(self, title: str) -> None:
-        self.sheets.setdefault(title, [])
+    async def get_sheet_roles(self) -> dict[int, str]:
+        return self.roles_sync()
 
-    async def get_values(self, range_name: str) -> list[list[object]]:
-        if self.on_read is not None:
-            self.on_read(self, range_name)
+    async def tag_sheet(self, sheet_id: int, role: str) -> None:
+        self.tag_sync(sheet_id, role)
+
+    async def add_sheet(self, title: str) -> None:
+        self.add_sheet_sync(title)
+
+    def rename(self, old: str, new: str) -> None:
+        """The user renames a tab: the id (and the hidden marker) stay."""
+        self.sheets = {(new if name == old else name): rows for name, rows in self.sheets.items()}
+        self._ids = {(new if name == old else name): sid for name, sid in self._ids.items()}
+
+    def sheet_id(self, title: str) -> int:
+        return self._ids[title]
+
+    # --- reading ------------------------------------------------------------------
+    @staticmethod
+    def _column(letter: str) -> int:
+        return ord(letter) - ord("A")
+
+    def _rows(self, range_name: str, raw: bool = False) -> list[list[object]]:
         name, _, cells = range_name.partition("!")
-        rows = [list(r) for r in self.sheets.get(name, [])]
+        if name not in self.sheets:
+            raise GoogleSheetsError(message=f"Unable to parse range: {range_name}", http_status=400)
+        rows = [list(r) for r in self.sheets[name]]
+        if not raw:
+            for (title, r, c), text in self.display.items():
+                if title == name and r < len(rows) and c < len(rows[r]):
+                    rows[r][c] = text
+        match = re.fullmatch(r"([A-Z]):([A-Z])", cells)
+        if match:  # whole columns, e.g. A:I
+            last = self._column(match.group(2)) + 1
+            rows = [r[:last] for r in rows]
         while rows and not any(str(c).strip() for c in rows[-1]):
             rows.pop()  # the API omits trailing empty rows
         return rows[:1] if cells == "1:1" else rows
 
+    async def get_values(self, range_name: str, *, raw: bool = False) -> list[list[object]]:
+        if self.on_read is not None:
+            self.on_read(self, range_name)
+        self.requests["read"] += 1
+        return self._rows(range_name, raw)
+
+    async def batch_get(self, ranges) -> list[list[list[object]]]:
+        self.requests["read"] += 1
+        return [self._rows(r) for r in ranges]
+
+    # --- writing --------------------------------------------------------------------
     def _set(self, name: str, row: int, col: int, value: object) -> None:
         rows = self.sheets.setdefault(name, [])
         while len(rows) <= row:
@@ -58,30 +148,71 @@ class SheetStore:
         rows[row][col] = value
 
     async def update_values(self, range_name: str, values: list[list[object]]) -> None:
+        self.update_sync(range_name, values)
+
+    def update_sync(self, range_name: str, values: list[list[object]]) -> None:
         name, _, cells = range_name.partition("!")
-        start = 0
-        if cells:
-            match = re.fullmatch(r"A(\d+)", cells)
-            assert match, cells
-            start = int(match.group(1)) - 1
-        elif self.fail_full_write:
+        match = re.fullmatch(r"([A-Z])(\d+)", cells)
+        assert match, cells
+        if self.fail_full_write and cells == "A2" and len(values[0]) > 1:
             raise GoogleSheetsError(message="write failed")
+        self.requests["write"] += 1
+        self.updates.append(name)
+        start_col, start_row = self._column(match.group(1)), int(match.group(2)) - 1
         for i, row in enumerate(values):
             for j, value in enumerate(row):
+                if value is None:
+                    continue  # the API skips null values: the cell stays as it is
                 if isinstance(value, str) and value.startswith("'"):
                     value = value[1:]  # USER_ENTERED: the apostrophe forces text and is consumed
-                self._set(name, start + i, j, value)
+                self._set(name, start_row + i, start_col + j, value)
 
     async def clear(self, range_name: str) -> None:
+        self.clear_sync(range_name)
+
+    def clear_sync(self, range_name: str) -> None:
         name, _, cells = range_name.partition("!")
-        first, last = (int(n) for n in re.findall(r"\d+", cells))
+        match = re.fullmatch(r"([A-Z])(\d+):([A-Z])(\d+)", cells)
+        assert match, cells
+        self.requests["write"] += 1
+        first_col, last_col = self._column(match.group(1)), self._column(match.group(3))
         rows = self.sheets.get(name, [])
-        for index in range(first - 1, min(last, len(rows))):
-            rows[index] = []
+        for index in range(int(match.group(2)) - 1, min(int(match.group(4)), len(rows))):
+            for col in range(first_col, min(last_col + 1, len(rows[index]))):
+                rows[index][col] = ""  # only the cleared columns, like the real API
+
+    async def batch_update(self, requests) -> None:
+        self.batch_update_sync(requests)
+
+    def batch_update_sync(self, requests) -> None:
+        if self.fail_batch_update:
+            raise GoogleSheetsError(message="batchUpdate failed")
+        self.requests["write"] += 1
+        self.batch_requests.extend(requests)
+        for request in requests:
+            update = request.get("updateCells")
+            if not update:
+                continue
+            sheet_id, row = update["range"]["sheetId"], update["range"]["startRowIndex"] + 1
+            cell = update["rows"][0]["values"][0]
+            note = cell.get("note")
+            colour = cell.get("userEnteredFormat", {}).get("backgroundColor")
+            for store, value in ((self.notes, note), (self.colours, colour)):
+                if value is None:
+                    store.pop((sheet_id, row), None)
+                else:
+                    store[(sheet_id, row)] = value
+
+    # --- test helpers ----------------------------------------------------------------
+    def note(self, title: str, row: int) -> str | None:
+        return self.notes.get((self._ids[title], row))
+
+    def colour(self, title: str, row: int) -> dict | None:
+        return self.colours.get((self._ids[title], row))
 
     def data_rows(self, name: str) -> list[list[object]]:
         rows = [r for r in self.sheets.get(name, [])[1:] if any(str(c).strip() for c in r)]
-        return [[str(c) for c in r] for r in rows]
+        return [trim([str(c) for c in r]) for r in rows]
 
 
 @dataclass(frozen=True)
@@ -233,7 +364,7 @@ def test_new_row_missing_required_field_is_not_created(schema: None, kind: Kind)
     store = _store(kind, row)
     _sync_expecting_errors(store)
     assert _records(kind) == []
-    assert store.data_rows(kind.sheet) == [[str(c) for c in row]]
+    assert store.data_rows(kind.sheet) == [trim([str(c) for c in row])]
 
 
 # --- update ------------------------------------------------------------------
@@ -266,7 +397,7 @@ def test_invalid_new_row_is_not_created_and_kept_as_typed(schema: None, kind: Ki
     [created] = _records(kind)  # the valid row is still imported
     assert created.name == kind.new_row[1]
     rows = store.data_rows(kind.sheet)
-    assert rows[0] == [str(c) for c in kind.invalid_new_row]  # untouched
+    assert rows[0] == trim([str(c) for c in kind.invalid_new_row])  # untouched
     assert rows[1][0] == str(created.id)
 
 
@@ -434,4 +565,4 @@ def test_short_kept_row_does_not_inherit_stale_cells(schema: None) -> None:
     )
     _sync_expecting_errors(store)
     rows = store.data_rows("Events")
-    assert rows[0] == ["", "Без даты", "", "", "", "", ""]
+    assert rows[0] == ["", "Без даты"]

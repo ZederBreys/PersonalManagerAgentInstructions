@@ -38,6 +38,9 @@ class Settings(BaseSettings):
     gmail_client_secret_file: str = ""
     gmail_token_file: str = ""
     gmail_max_messages: int = 100
+    # How often the sheet is checked for edits (one cheap read; a sync runs only
+    # after the edits have settled). The full sync still runs every 30 minutes.
+    sheets_poll_seconds: int = 5
 
     @field_validator("log_level")
     @classmethod
@@ -82,6 +85,13 @@ class Settings(BaseSettings):
     def _validate_gmail_max_messages(cls, value: int) -> int:
         if value <= 0:
             raise ValueError("gmail_max_messages must be a positive integer")
+        return value
+
+    @field_validator("sheets_poll_seconds")
+    @classmethod
+    def _validate_sheets_poll_seconds(cls, value: int) -> int:
+        if value < 1:
+            raise ValueError("sheets_poll_seconds must be at least 1")
         return value
 
     @property

@@ -13,11 +13,18 @@ import re
 import secrets
 from datetime import date, datetime
 
+from app.dates import next_occurrence, next_reminder_date
 from app.models.event import Event, EventRecurrence
 from app.models.expense import ExpensePeriod, RecurringExpense
 from app.models.reminder import Reminder
 
-EVENT_HEADERS = ["ID", "Событие", "Дата", "Повтор", "Напоминание", "Что сделать", "Статус"]
+# Columns H and I of Events are filled by the bot (never read back).
+EVENT_HEADERS = [
+    "ID", "Событие", "Дата", "Повтор", "Напоминание", "Что сделать", "Активно",
+    "Когда будет напомнено", "Когда событие случится",
+]
+# Writing this word into the "Активно" cell deletes the record (any letter case).
+DELETE_WORD = "удалить"
 EXPENSE_HEADERS = [
     "ID",
     "Название",
@@ -60,6 +67,11 @@ def str_to_bool(value: str) -> bool:
 
 def date_to_str(value: date) -> str:
     return value.isoformat()
+
+
+def date_to_ru(value: date | None) -> str:
+    """``DD.MM.YYYY`` for the bot-filled columns ("" when there is no date)."""
+    return value.strftime("%d.%m.%Y") if value else ""
 
 
 _RU_DATE_RE = re.compile(r"^(\d{2})\.(\d{2})\.(\d{4})$")
@@ -140,23 +152,55 @@ def offsets_to_str(offsets: list[int]) -> str:
     return ", ".join(str(v) for v in offsets)
 
 
+# Reminder lead times, as a person writes them: "7", "за 15 дней", "за день до
+# события", "за 2 недели", "в день события"; several are separated by "," ";" or "и".
+_OFFSET_SPLIT_RE = re.compile(r"\s*(?:,|;|\s+и\s+)\s*")
+_SAME_DAY_PHRASES = {"в день события", "в день", "в тот же день", "в день даты", "в этот день", "сегодня"}
+_OFFSET_PART_RE = re.compile(
+    r"^(?:за\s+)?"
+    r"(?:(?P<n>\d+)\s*(?P<unit>дней|дня|день|дн\.?|д\.?|недели|недель|неделю|нед\.?)?"
+    r"|(?P<one>день|неделю))"
+    r"(?:\s+до\s+(?:события|даты(?:\s+события)?))?$"
+)
+
+
+def _offset_days(part: str) -> int:
+    normalized = " ".join(part.strip().lower().split())
+    if normalized in _SAME_DAY_PHRASES:
+        return 0
+    match = _OFFSET_PART_RE.match(normalized)
+    if match is None:
+        raise ValueError(f"Invalid reminder offsets: {part!r}")
+    if match["one"]:
+        return 7 if match["one"] == "неделю" else 1
+    days = int(match["n"])
+    return days * 7 if (match["unit"] or "").startswith("нед") else days
+
+
 def str_to_offsets(value: str) -> list[int]:
-    parts = [part.strip() for part in value.split(",")]
-    if not parts or any(not part for part in parts):
-        raise ValueError(f"Invalid reminder offsets: {value!r}")
+    """Parse reminder lead times (in days) into a sorted, de-duplicated list."""
+
+    error = ValueError(
+        f"Invalid reminder offsets: {value!r} (expected days before the event, "
+        "e.g. '3', 'за 15 дней', 'за день до события', 'в день события')"
+    )
+    parts = _OFFSET_SPLIT_RE.split(value.strip())
+    if any(not part for part in parts):
+        raise error
     try:
-        values = [int(part) for part in parts]
-    except ValueError as exc:
-        raise ValueError(f"Invalid reminder offsets: {value!r}") from exc
-    if any(v < 0 for v in values):
-        raise ValueError("Reminder offsets must be non-negative days")
-    return sorted(set(values))
+        return sorted({_offset_days(part) for part in parts})
+    except ValueError:
+        raise error from None
 
 
 _RECURRENCE_WORDS = {
-    EventRecurrence.NONE: {"none", "нет", "разово", "однократно", "один раз", "once", "no", "-", "не повторять"},
+    EventRecurrence.NONE: {
+        "none", "нет", "разово", "разовое", "однократно", "один раз", "единожды", "одноразово",
+        "once", "no", "-", "не повторять", "не повторяется",
+    },
     EventRecurrence.YEARLY: {
-        "yearly", "ежегодно", "ежегодный", "каждый год", "раз в год", "год", "annual", "annually",
+        "yearly", "ежегодно", "ежегодный", "каждый год", "раз в год", "через год", "год",
+        "annual", "annually",
     },
 }
 _PERIOD_WORDS = {
@@ -185,8 +229,18 @@ def _lookup(words_by_value: dict, value: str):
     return None
 
 
+_UNSUPPORTED_REPEAT_RE = re.compile(
+    r"месяц|квартал|недел|ежедневн|каждый день|каждые|monthly|weekly|daily|quarterly"
+)
+
+
 def _recurrence(value: str) -> EventRecurrence:
     found = _lookup(_RECURRENCE_WORDS, value)
+    if found is None and _UNSUPPORTED_REPEAT_RE.search(value.lower()):
+        raise ValueError(
+            f"Unsupported recurrence: {value!r} (an event can only be one-off 'none' or "
+            "'yearly'; monthly/quarterly repeats are supported for payments on the Expenses sheet)"
+        )
     if found is None:
         raise ValueError(
             f"Invalid recurrence: {value!r} (expected 'none' = one-off or 'yearly' = every year)"
@@ -217,6 +271,13 @@ def _parse_int(value: str, label: str) -> int:
 
 def _cell(row: list[object], index: int) -> object | None:
     return row[index] if index < len(row) else None
+
+
+def _is_delete_request(row: list[object], index: int) -> bool:
+    """True when the "active" cell holds the delete word (case-insensitive)."""
+
+    text = _cell_text(row, index)
+    return text is not None and text.lower() == DELETE_WORD
 
 
 def _cell_text(row: list[object], index: int) -> str | None:
@@ -296,7 +357,15 @@ def require_new_expense_fields(fields: dict) -> None:
 
 # --- Events ----------------------------------------------------------------
 
-def event_to_row(event: Event) -> list[object]:
+def event_to_row(event: Event, today: date | None = None) -> list[object]:
+    today = today or date.today()
+    if event.is_active:
+        remind = next_reminder_date(
+            event.recurrence, event.next_date, event.anchor_date, event.reminder_offsets or [0], today
+        )
+        happens = next_occurrence(event.recurrence, event.next_date, event.anchor_date, today)
+    else:  # paused: nothing is coming
+        remind = happens = None
     return [
         event.id,
         text_cell(event.name),
@@ -305,6 +374,8 @@ def event_to_row(event: Event) -> list[object]:
         offsets_to_str(event.reminder_offsets or [0]),
         text_cell(event.action_text or ""),
         bool_to_str(event.is_active),
+        date_to_ru(remind),
+        date_to_ru(happens),
     ]
 
 
@@ -316,6 +387,8 @@ def parse_event_row(row: list[object]) -> dict:
     omitted from the result. Raises ``ValueError`` for any invalid value.
     """
     fields: dict = {"id": parse_row_key(row)}
+    if _is_delete_request(row, 6):
+        return {**fields, "delete": True}  # the rest of the row is irrelevant
 
     name = _cell_text(row, 1)
     if name is not None:
@@ -364,6 +437,8 @@ def expense_to_row(expense: RecurringExpense) -> list[object]:
 def parse_expense_row(row: list[object]) -> dict:
     """Parse a sheet row into ``{"id": <row key>, **fields}`` (see parse_event_row)."""
     fields: dict = {"id": parse_row_key(row)}
+    if _is_delete_request(row, 8):
+        return {**fields, "delete": True}
 
     name = _cell_text(row, 1)
     if name is not None:
@@ -402,10 +477,10 @@ def parse_expense_row(row: list[object]) -> dict:
 
     reminder_days = _cell_text(row, 9)
     if reminder_days is not None:
-        days = _parse_int(reminder_days, "reminder days")
-        if days < 0:
-            raise ValueError(f"Reminder days must be 0 or more: {reminder_days!r}")
-        fields["reminder_days_before"] = days
+        days = str_to_offsets(reminder_days)
+        if len(days) != 1:
+            raise ValueError(f"Reminder days must be a single value: {reminder_days!r}")
+        fields["reminder_days_before"] = days[0]
 
     return fields
 

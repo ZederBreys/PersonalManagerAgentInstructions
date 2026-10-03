@@ -19,12 +19,41 @@ from __future__ import annotations
 
 import asyncio
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, TypeVar
 
 from app.config import Settings
 
 _T = TypeVar("_T")
+
+# Hidden marker (Sheets "developer metadata") that tells which sheet plays which
+# role. It stays on the sheet when the user renames or reorders tabs, so the
+# application never depends on tab names or positions.
+METADATA_KEY = "personal_manager_sheet"
+
+
+@dataclass(frozen=True)
+class SheetInfo:
+    """A sheet (tab) of the spreadsheet: its stable numeric id and current title."""
+
+    sheet_id: int
+    title: str
+
+
+def _quote_range(range_name: str) -> str:
+    """Quote the sheet title of an A1 range (``Events!A1`` -> ``'Events'!A1``).
+
+    Titles with spaces, Cyrillic or other special characters are only valid in
+    quotes; a quote inside the title is doubled. Callers pass plain
+    ``Title!cells`` (or just ``Title`` for the whole sheet).
+    """
+
+    title, bang, cells = range_name.rpartition("!")
+    if not bang:
+        title, cells = range_name, ""
+    quoted = "'" + title.replace("'", "''") + "'"
+    return f"{quoted}!{cells}" if bang else quoted
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 # Write values as if the user typed them. With RAW, every value we wrote back
@@ -38,6 +67,9 @@ _VALUE_INPUT_OPTION = "USER_ENTERED"
 # type: a date cell comes back as "24.08.2025" in a ru_RU sheet, a number as
 # "12,5". The mappers accept those display forms.
 _VALUE_RENDER_OPTION = "FORMATTED_VALUE"
+# The underlying values: numbers stay numbers, dates are serial numbers, whatever
+# number format the user gave the cell. Used where the displayed text is unreliable.
+_VALUE_RENDER_RAW = "UNFORMATTED_VALUE"
 
 
 class GoogleSheetsError(Exception):
@@ -116,12 +148,16 @@ class GoogleSheetsClient:
             self._service = _build_service(self._service_account_file)
         return self._service
 
-    async def get_values(self, range_name: str) -> list[list[object]]:
-        """Read a range; return the list of rows (no header interpretation)."""
+    async def get_values(self, range_name: str, *, raw: bool = False) -> list[list[object]]:
+        """Read a range; return the list of rows (no header interpretation).
 
-        return await self._call(self._get_values, range_name)
+        By default cells come back as displayed text; ``raw=True`` returns the
+        underlying values instead (see ``_VALUE_RENDER_RAW``).
+        """
 
-    def _get_values(self, range_name: str) -> list[list[object]]:
+        return await self._call(self._get_values, range_name, raw)
+
+    def _get_values(self, range_name: str, raw: bool = False) -> list[list[object]]:
         from googleapiclient.errors import HttpError
 
         try:
@@ -131,8 +167,8 @@ class GoogleSheetsClient:
                 .values()
                 .get(
                     spreadsheetId=self._spreadsheet_id,
-                    range=range_name,
-                    valueRenderOption=_VALUE_RENDER_OPTION,
+                    range=_quote_range(range_name),
+                    valueRenderOption=_VALUE_RENDER_RAW if raw else _VALUE_RENDER_OPTION,
                 )
                 .execute()
             )
@@ -153,7 +189,7 @@ class GoogleSheetsClient:
         try:
             self._get_service().spreadsheets().values().update(
                 spreadsheetId=self._spreadsheet_id,
-                range=range_name,
+                range=_quote_range(range_name),
                 valueInputOption=_VALUE_INPUT_OPTION,
                 body={"values": values},
             ).execute()
@@ -173,7 +209,7 @@ class GoogleSheetsClient:
         try:
             self._get_service().spreadsheets().values().append(
                 spreadsheetId=self._spreadsheet_id,
-                range=range_name,
+                range=_quote_range(range_name),
                 valueInputOption=_VALUE_INPUT_OPTION,
                 insertDataOption="INSERT_ROWS",
                 body={"values": values},
@@ -193,7 +229,7 @@ class GoogleSheetsClient:
 
         try:
             self._get_service().spreadsheets().values().clear(
-                spreadsheetId=self._spreadsheet_id, range=range_name, body={}
+                spreadsheetId=self._spreadsheet_id, range=_quote_range(range_name), body={}
             ).execute()
         except HttpError as exc:
             raise GoogleSheetsError(
@@ -223,6 +259,102 @@ class GoogleSheetsClient:
             sheet["properties"]["title"]
             for sheet in result.get("sheets", [])
         ]
+
+    async def get_sheets(self) -> list[SheetInfo]:
+        """Return every sheet with its stable id and current title."""
+
+        return await self._call(self._get_sheets)
+
+    def _get_sheets(self) -> list[SheetInfo]:
+        result = self._execute(
+            lambda service: service.spreadsheets().get(
+                spreadsheetId=self._spreadsheet_id, fields="sheets.properties(sheetId,title)"
+            )
+        )
+        return [
+            SheetInfo(sheet["properties"]["sheetId"], sheet["properties"]["title"])
+            for sheet in result.get("sheets", [])
+        ]
+
+    async def get_sheet_roles(self) -> dict[int, str]:
+        """Return ``{sheet_id: role}`` for the sheets carrying our hidden marker."""
+
+        return await self._call(self._get_sheet_roles)
+
+    def _get_sheet_roles(self) -> dict[int, str]:
+        body = {"dataFilters": [{"developerMetadataLookup": {"metadataKey": METADATA_KEY}}]}
+        result = self._execute(
+            lambda service: service.spreadsheets()
+            .developerMetadata()
+            .search(spreadsheetId=self._spreadsheet_id, body=body)
+        )
+        roles: dict[int, str] = {}
+        for match in result.get("matchedDeveloperMetadata", []):
+            metadata = match.get("developerMetadata", {})
+            sheet_id = metadata.get("location", {}).get("sheetId")
+            if sheet_id is not None and metadata.get("metadataValue"):
+                roles[sheet_id] = metadata["metadataValue"]
+        return roles
+
+    async def tag_sheet(self, sheet_id: int, role: str) -> None:
+        """Attach the hidden role marker to a sheet (invisible to the user)."""
+
+        await self.batch_update(
+            [
+                {
+                    "createDeveloperMetadata": {
+                        "developerMetadata": {
+                            "metadataKey": METADATA_KEY,
+                            "metadataValue": role,
+                            "location": {"sheetId": sheet_id},
+                            "visibility": "DOCUMENT",
+                        }
+                    }
+                }
+            ]
+        )
+
+    async def batch_get(self, ranges: Sequence[str]) -> list[list[list[object]]]:
+        """Read several ranges in ONE request; one list of rows per range."""
+
+        return await self._call(self._batch_get, list(ranges))
+
+    def _batch_get(self, ranges: list[str]) -> list[list[list[object]]]:
+        result = self._execute(
+            lambda service: service.spreadsheets()
+            .values()
+            .batchGet(
+                spreadsheetId=self._spreadsheet_id,
+                ranges=[_quote_range(r) for r in ranges],
+                valueRenderOption=_VALUE_RENDER_OPTION,
+            )
+        )
+        return [value_range.get("values", []) for value_range in result.get("valueRanges", [])]
+
+    async def batch_update(self, requests: Sequence[dict[str, Any]]) -> None:
+        """Send structural/format requests (notes, colours, ...) in one call."""
+
+        if requests:
+            await self._call(self._batch_update, list(requests))
+
+    def _batch_update(self, requests: list[dict[str, Any]]) -> None:
+        self._execute(
+            lambda service: service.spreadsheets().batchUpdate(
+                spreadsheetId=self._spreadsheet_id, body={"requests": requests}
+            )
+        )
+
+    def _execute(self, build_request: Callable[[Any], Any]) -> Any:
+        """Execute one API request, translating HTTP errors to GoogleSheetsError."""
+
+        from googleapiclient.errors import HttpError
+
+        try:
+            return build_request(self._get_service()).execute()
+        except HttpError as exc:
+            raise GoogleSheetsError(
+                message=_http_message(exc), http_status=_http_status(exc)
+            ) from exc
 
     async def add_sheet(self, title: str) -> None:
         """Create a new sheet with the given ``title`` (idempotent by caller)."""

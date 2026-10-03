@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TextIO
 
@@ -228,6 +229,10 @@ async def run(
             make_streak_failure_notifier(services.telegram, services.chat_id),
             jobs=jobs,
             running=running_jobs,
+        )
+        # Lets the cheap sheet watcher ask for a real (recorded) sync right away.
+        services.request_sync = lambda: scheduler.modify_job(
+            "sheets_sync", next_run_time=datetime.now(timezone.utc)
         )
         scheduler.start()
         for job in scheduler.get_jobs():

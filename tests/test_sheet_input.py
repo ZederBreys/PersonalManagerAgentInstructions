@@ -212,3 +212,124 @@ def test_fresh_running_job_is_kept_without_the_instance_lock(schema: None) -> No
     run, telegram = _start_app_after_crash(exclusive=False)
     assert run.status is JobRunStatus.RUNNING
     assert not any("crashed_job" in text for text in telegram.sent)
+
+
+# --- phrases people write in "Повтор" and "Напоминание" ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("typed", "expected"),
+    [
+        ("Один раз", "none"), ("Единожды", "none"), ("Не повторяется", "none"),
+        ("Через год", "yearly"), ("Раз в год", "yearly"),
+    ],
+)
+def test_recurrence_phrases(typed: str, expected: str) -> None:
+    assert parse_event_row([1, "x", "2026-10-15", typed])["recurrence"].value == expected
+
+
+@pytest.mark.parametrize("typed", ["Каждый 2 месяца", "Каждые 2 месяца", "каждый месяц", "раз в неделю", "ежедневно"])
+def test_unsupported_repeat_intervals_get_a_specific_message(typed: str) -> None:
+    with pytest.raises(ValueError, match="Unsupported recurrence.*only.*'none'.*'yearly'.*Expenses"):
+        parse_event_row([1, "x", "2026-10-15", typed])
+
+
+@pytest.mark.parametrize(
+    ("typed", "days"),
+    [
+        ("За 15 дней", [15]), ("за 3 дня", [3]), ("За день до события", [1]),
+        ("за 1 день", [1]), ("в день события", [0]), ("в день", [0]),
+        ("за неделю", [7]), ("за 2 недели", [14]), ("за 3 д.", [3]),
+        ("за 3 дня до даты", [3]), ("7", [7]), ("0, 15", [0, 15]),
+        ("за 15 дней и за 3 дня", [3, 15]), ("за 15 дней, за день до события, в день события", [0, 1, 15]),
+    ],
+)
+def test_reminder_phrases(typed: str, days: list[int]) -> None:
+    assert parse_event_row([1, "x", "2026-10-15", "", typed])["reminder_offsets"] == days
+
+
+@pytest.mark.parametrize("typed", ["скоро", "за -3 дня", "за дней", "-1", "a,b", "1,,2", "за три дня"])
+def test_unclear_reminder_text_is_rejected_with_examples(typed: str) -> None:
+    with pytest.raises(ValueError, match="Invalid reminder offsets.*за 15 дней"):
+        parse_event_row([1, "x", "2026-10-15", "", typed])
+
+
+def test_expense_reminder_days_accept_phrases_but_only_one_value() -> None:
+    assert parse_expense_row([1, "x", "1", "RUB", "", "", "", "", "", "за 5 дней"])["reminder_days_before"] == 5
+    assert parse_expense_row([1, "x", "1", "RUB", "", "", "", "", "", "0"])["reminder_days_before"] == 0
+    with pytest.raises(ValueError, match="single value"):
+        parse_expense_row([1, "x", "1", "RUB", "", "", "", "", "", "за 5 дней и за 1 день"])
+
+
+def test_event_row_with_phrases_is_imported_end_to_end(schema: None) -> None:
+    _sync(_store(EVENTS, ["", "Годовщина", "24.12.2026", "Через год", "за 15 дней, за день до события", "Купить подарок", "Да"]))
+    [event] = _records(EVENTS)
+    assert event.recurrence.value == "yearly" and event.reminder_offsets == [1, 15]
+    assert event.is_active is True
+
+
+# --- notes to the right of the table ------------------------------------------------------
+
+
+def test_notes_right_of_the_table_stay_next_to_their_record(schema: None) -> None:
+    """A blank row between records used to be compacted: the rows below shifted
+    up while the user's notes (column H and beyond) stayed where they were."""
+
+    from app.google_sheets.mappers import EVENT_HEADERS
+    from tests.test_google_sheets_two_way import SheetStore
+
+    first = ["", "Первое", "2026-12-24", "none", "0", "", "да", "", "", "заметка 1"]
+    second = ["", "Второе", "2026-12-25", "none", "0", "", "да", "", "", "заметка 2"]
+    store = SheetStore({"Events": [list(EVENT_HEADERS), first, [], second]})
+
+    _sync(store)
+    _sync(store)
+
+    rows = store.sheets["Events"]
+    assert [r[1] if len(r) > 1 else "" for r in rows[1:]] == ["Первое", "", "Второе"]  # nothing shifted
+    assert [r[9] if len(r) > 9 else "" for r in rows[1:]] == ["заметка 1", "", "заметка 2"]
+    assert len(_records(EVENTS)) == 2
+
+
+# --- yearly events entered with a past date ----------------------------------------------
+
+
+def _notifications_text() -> list[str]:
+    from sqlalchemy import select
+
+    from app.models.notification import Notification
+
+    async def _r() -> list[str]:
+        async with db.get_session() as session:
+            return [n.text for n in (await session.execute(select(Notification))).scalars()]
+
+    return asyncio.run(_r())
+
+
+def test_yearly_event_with_past_date_moves_on_without_a_stale_reminder(schema: None) -> None:
+    from app.jobs import daily_reminders
+    from tests.test_google_sheets_two_way import SheetStore
+    from app.google_sheets.mappers import EVENT_HEADERS
+
+    store = SheetStore({"Events": [list(EVENT_HEADERS),
+                                   ["", "День рождения", "24.08.2026", "каждый год", "за 7 дней", "Купить подарок", ""]]})
+    services = Services(settings=Settings(_env_file=None), sheets=store)  # type: ignore[arg-type]
+    _sync(store)
+
+    asyncio.run(daily_reminders(services, today=date(2026, 10, 3)))  # the date has passed
+    assert _notifications_text() == []  # no "уже прошло" reminder
+    assert _records(EVENTS)[0].next_date == date(2027, 8, 24)  # moved to the next occurrence
+
+    asyncio.run(daily_reminders(services, today=date(2027, 8, 17)))  # 7 days before
+    [text] = _notifications_text()
+    assert "День рождения" in text and "через 7 дн." in text
+
+
+def test_reminder_missed_while_the_app_was_down_is_still_sent_late(schema: None) -> None:
+    from app.jobs import daily_reminders
+
+    services = Services(settings=Settings(_env_file=None))
+    _sync(_store(EVENTS, ["", "Встреча", "2026-12-24", "none", "3", "", ""]))  # reminder due 21.12
+    asyncio.run(daily_reminders(services, today=date(2026, 12, 26)))  # app was down until after the date
+    [text] = _notifications_text()
+    assert "Встреча" in text and "уже прошло" in text

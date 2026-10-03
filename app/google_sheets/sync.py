@@ -27,9 +27,11 @@ back only its own changes and never commits unrelated pending state.
 from __future__ import annotations
 
 import logging
+import math
+import re
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 from sqlalchemy import select
@@ -74,12 +76,85 @@ class SheetValidationError(ValueError):
         super().__init__(f"Row {row_number}: {message}")
 
 
-def _is_header_row(row: list[object], headers: list[str]) -> bool:
-    return bool(row) and isinstance(row[0], str) and row[0].strip() == headers[0]
+@dataclass(frozen=True)
+class RowReport:
+    """What import did with one sheet row (for the feedback written to the sheet)."""
+
+    row_number: int  # 1-based sheet row
+    record_id: int | None = None  # the record the row now stands for
+    error: str | None = None  # why the row was not accepted
+    deleted: bool = False  # the row asked for deletion and the record was deleted
 
 
-def _is_empty_row(row: list[object]) -> bool:
-    return all(cell is None or (isinstance(cell, str) and not cell.strip()) for cell in row)
+def _is_empty_row(row: list[object], width: int | None = None) -> bool:
+    """True when the table's own cells (the first ``width`` columns) are all empty.
+
+    Cells further right belong to the user (notes); a row holding only a note is
+    not a record, so it is neither imported nor flagged.
+    """
+
+    cells = row if width is None else row[:width]
+    return all(cell is None or (isinstance(cell, str) and not cell.strip()) for cell in cells)
+
+
+# --- reading the real values behind the displayed text ----------------------------------
+
+_EXCEL_EPOCH = date(1899, 12, 30)  # serial 0 of Google Sheets / Excel
+_NUMBER_NOISE = re.compile(r"(?i)\s|\u00a0|\u202f|₽|\$|€|руб\.?|р\.|rub|usd|eur")
+
+
+def _serial_to_iso(serial: float) -> str | None:
+    try:
+        return (_EXCEL_EPOCH + timedelta(days=math.floor(serial))).isoformat()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _shown_number(shown: object) -> float | None:
+    text = _NUMBER_NOISE.sub("", str(shown)).replace(",", ".")
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _normalize_rows(
+    data: list[list[object]], raw: list[list[object]], columns: dict[int, str]
+) -> tuple[list[list[object]], dict[int, str]]:
+    """Replace displayed text by the underlying value in date/number columns.
+
+    A date cell shown in any custom format (``суббота, 24 августа``) is read as
+    its real date. A number cell whose displayed text disagrees with its value
+    (for example a date format on an amount: it shows ``11.1`` but holds 12.5)
+    is rejected with an explanation instead of being guessed. Returns the
+    normalized rows and ``{sheet row number: message}`` for rejected rows.
+    """
+
+    normalized = [list(row) for row in data]
+    errors: dict[int, str] = {}
+    for i in range(1, min(len(data), len(raw))):
+        for col, kind in columns.items():
+            if col >= len(raw[i]) or col >= len(data[i]):
+                continue
+            value = raw[i][col]
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue  # text: the displayed text is what was typed
+            if kind == "date":
+                iso = _serial_to_iso(value)
+                if iso:
+                    normalized[i][col] = iso
+                continue
+            shown = _shown_number(data[i][col])
+            if shown is None or abs(shown - value) > 1e-9 * max(1.0, abs(value)):
+                errors.setdefault(
+                    i + 1,
+                    f"The cell shows {data[i][col]!r} but holds the number {value:g}: its format "
+                    "(e.g. a date format) hides the real value. Clear the cell's format "
+                    "(Format -> Number -> Automatic) and retype it",
+                )
+            else:
+                normalized[i][col] = repr(int(value)) if float(value).is_integer() else repr(float(value))
+    return normalized, errors
 
 
 def _safe_row_key(row: list[object]) -> RowKey:
@@ -103,6 +178,11 @@ class _SheetSpec:
     list_all: Callable[[AsyncSession], Awaitable[list]]
     create: Callable[[AsyncSession, dict], Awaitable[Any]]
     update: Callable[[AsyncSession, Any, dict], Awaitable[Any]]
+    delete: Callable[[AsyncSession, Any], Awaitable[None]]
+    # column index -> "date" | "number": read from the real value, not the display
+    numeric_columns: dict[int, str]
+    active_column: int  # the yes/no column (kept boolean where the user uses checkboxes)
+    user_columns: int  # columns A.. that the user types into (the rest is bot-filled)
 
 
 # --- Export -----------------------------------------------------------------
@@ -116,37 +196,57 @@ def _column_letter(index: int) -> str:
 async def _write_sheet(
     client: GoogleSheetsClient,
     sheet_name: str,
-    headers: list[str],
-    rows: list[list[object]],
+    width: int,
+    rows: list[list[object] | None],
     *,
     old_length: int,
 ) -> None:
-    """Write ``headers`` + ``rows`` and clear the stale tail.
+    """Write the data ``rows`` from A2 down and clear the stale tail.
 
-    Writing before clearing means a failed write never erases previous data.
-    Rows are padded to the header width: ``values.update`` leaves cells it is
-    not given untouched, so a short row moved onto a longer one would otherwise
-    keep the old row's trailing cells.
+    Row 1 (the header) is never written here: its text is the user's to rename.
+    A row that is ``None`` is not ours (invalid, unknown, blank): all its cells
+    are sent as JSON null, which the API skips, so the user's cells stay exactly
+    as they are. Writing before clearing means a failed write never erases
+    previous data. Rows are padded to the table width: ``values.update`` leaves
+    cells it is not given untouched, so a short row moved onto a longer one
+    would otherwise keep the old row's trailing cells.
     """
 
-    width = len(headers)
-    new_values = [headers, *(list(row) + [""] * (width - len(row)) for row in rows)]
-    await client.update_values(sheet_name, new_values)
-    if old_length > len(new_values):
-        last_col = _column_letter(len(headers) - 1)
-        await client.clear(f"{sheet_name}!A{len(new_values) + 1}:{last_col}{old_length}")
+    if any(row is not None for row in rows):
+        padded = [
+            [None] * width if row is None else list(row) + [""] * (width - len(row)) for row in rows
+        ]
+        await client.update_values(f"{sheet_name}!A2", padded)
+    last_row = 1 + len(rows)
+    if old_length > last_row:
+        last_col = _column_letter(width - 1)
+        await client.clear(f"{sheet_name}!A{last_row + 1}:{last_col}{old_length}")
 
 
 async def _overwrite_sheet(
     client: GoogleSheetsClient,
     sheet_name: str,
-    headers: list[str],
+    width: int,
     rows: list[list[object]],
 ) -> None:
-    """Replace an export-only sheet with ``headers`` + ``rows``."""
+    """Replace the data rows of an export-only sheet."""
 
     old = await client.get_values(sheet_name)
-    await _write_sheet(client, sheet_name, headers, rows, old_length=len(old))
+    await _write_sheet(client, sheet_name, width, list(rows), old_length=len(old))
+
+
+def _edited_since(spec: _SheetSpec, snapshot: list[list[object]], offset: int, row: list[object]) -> bool:
+    """Did the user change this row after the import read it? (ID column excluded:
+    the import itself may have stamped it.)"""
+
+    if offset >= len(snapshot):
+        return True  # the row did not exist at import time
+
+    def cells(values: list[object]) -> list[str]:
+        padded = list(values) + [""] * spec.user_columns
+        return [str(cell).strip() for cell in padded[1 : spec.user_columns]]
+
+    return cells(snapshot[offset]) != cells(row)
 
 
 async def _export_merged(
@@ -154,32 +254,58 @@ async def _export_merged(
     client: GoogleSheetsClient,
     spec: _SheetSpec,
     preserve: Collection[RowKey],
+    blank_rows: Collection[int],
+    import_snapshot: list[list[object]] | None = None,
 ) -> None:
-    """Refresh known rows from SQLite, keep every other user row untouched."""
+    """Refresh known rows from SQLite; every row that is not ours is left alone.
+
+    Rows keep their exact positions, blank rows included: the user may keep
+    notes in columns to the right of the table, and those must stay next to
+    their record. Only the table's own columns are written, and only for rows
+    of known records: invalid, unknown, duplicate and blank rows are skipped, so
+    the user's cells (including their types and formats) are never rewritten.
+    ``blank_rows`` are rows whose record was just deleted at the user's request:
+    their table cells are cleared. Where the user keeps the yes/no column as a
+    checkbox the value stays a boolean. A row the user edited after the import read
+    the sheet (``import_snapshot``) is not written either: the edit is picked up by
+    the next sync instead of being overwritten.
+    """
 
     records = await spec.list_all(session)
     by_id = {record.id: record for record in records}
     by_key = {record.sheet_key: record for record in records if record.sheet_key}
+    width = len(spec.headers)
 
     current = await client.get_values(spec.sheet)
-    start = 1 if (current and _is_header_row(current[0], spec.headers)) else 0
-    rows: list[list[object]] = []
+    raw_current = await client.get_values(spec.sheet, raw=True)
+    rows: list[list[object] | None] = []
     placed: set[int] = set()
-    for row in current[start:]:
-        if _is_empty_row(row):
+    for offset, row in enumerate(current[1:], start=1):  # row 1 is the header
+        if offset + 1 in blank_rows:
+            rows.append([""] * width)  # deleted at the user's request: clear it
+            continue
+        if _is_empty_row(row, width):
+            rows.append(None)  # blank row: keep its place so the rows below do not shift
             continue
         key = _safe_row_key(row)
         record = by_id.get(key) if isinstance(key, int) else by_key.get(key)
         if record is None or record.id in placed:
-            rows.append(list(row))  # unknown, invalid, new or duplicate row
+            rows.append(None)  # unknown, new or duplicate row: not ours to write
             continue
-        placed.add(record.id)
+        placed.add(record.id)  # this record has its row, even if the row is invalid
         if key in preserve:
-            rows.append(list(row))  # the user's edit failed import: keep it
-        else:
-            rows.append(spec.to_row(record))
+            rows.append(None)  # the user's edit failed import: leave it exactly as typed
+            continue
+        if import_snapshot is not None and _edited_since(spec, import_snapshot, offset, row):
+            rows.append(None)  # edited while the sync was running: do not overwrite it
+            continue
+        new_row = spec.to_row(record)
+        raw_row = raw_current[offset] if offset < len(raw_current) else []
+        if spec.active_column < len(raw_row) and isinstance(raw_row[spec.active_column], bool):
+            new_row[spec.active_column] = bool(record.is_active)  # a checkbox stays a checkbox
+        rows.append(new_row)
     rows.extend(spec.to_row(record) for record in records if record.id not in placed)
-    await _write_sheet(client, spec.sheet, spec.headers, rows, old_length=len(current))
+    await _write_sheet(client, spec.sheet, width, rows, old_length=len(current))
 
 
 async def export_events(
@@ -187,13 +313,17 @@ async def export_events(
     client: GoogleSheetsClient,
     *,
     preserve: Collection[RowKey] = (),
+    sheet: str | None = None,
+    blank_rows: Collection[int] = (),
+    import_snapshot: list[list[object]] | None = None,
 ) -> None:
     """Merge all events (including inactive) into the Events sheet.
 
     ``preserve`` holds the keys of rows whose import failed; they stay as typed.
+    ``sheet`` is the sheet's current tab title (default: the legacy name).
     """
 
-    await _export_merged(session, client, _EVENTS, preserve)
+    await _export_merged(session, client, _on_sheet(_EVENTS, sheet), preserve, blank_rows, import_snapshot)
 
 
 async def export_expenses(
@@ -201,17 +331,28 @@ async def export_expenses(
     client: GoogleSheetsClient,
     *,
     preserve: Collection[RowKey] = (),
+    sheet: str | None = None,
+    blank_rows: Collection[int] = (),
+    import_snapshot: list[list[object]] | None = None,
 ) -> None:
     """Merge all expenses (including inactive) into the Expenses sheet."""
 
-    await _export_merged(session, client, _EXPENSES, preserve)
+    await _export_merged(
+        session, client, _on_sheet(_EXPENSES, sheet), preserve, blank_rows, import_snapshot
+    )
 
 
-async def export_reminders(session: AsyncSession, client: GoogleSheetsClient) -> None:
-    """Overwrite the Reminders sheet with all reminders (export-only sheet)."""
+async def export_reminders(
+    session: AsyncSession, client: GoogleSheetsClient, *, sheet: str | None = None
+) -> None:
+    """Overwrite the data rows of the Reminders sheet (export-only sheet)."""
 
     rows = [reminder_to_row(r) for r in await reminders.list_reminders(session)]
-    await _overwrite_sheet(client, "Reminders", REMINDER_HEADERS, rows)
+    await _overwrite_sheet(client, sheet or "Reminders", len(REMINDER_HEADERS), rows)
+
+
+def _on_sheet(spec: _SheetSpec, sheet: str | None) -> _SheetSpec:
+    return spec if sheet is None else replace(spec, sheet=sheet)
 
 
 # --- Import -----------------------------------------------------------------
@@ -244,6 +385,7 @@ class _PlannedRow:
     key: RowKey
     record: Any
     fields: dict
+    delete: bool = False
 
 
 async def _find_record(session: AsyncSession, spec: _SheetSpec, key: RowKey) -> Any:
@@ -261,33 +403,46 @@ async def _find_record(session: AsyncSession, spec: _SheetSpec, key: RowKey) -> 
 
 
 async def _plan_rows(
-    session: AsyncSession, spec: _SheetSpec, data: list[list[object]]
+    session: AsyncSession,
+    spec: _SheetSpec,
+    data: list[list[object]],
+    normalized: list[list[object]],
+    cell_errors: dict[int, str],
 ) -> tuple[list[_PlannedRow], list[SheetValidationError]]:
-    """Parse and validate every data row; collect errors instead of stopping."""
+    """Parse and validate every data row; collect errors instead of stopping.
+
+    ``data`` is the sheet as displayed (used for keys and the stamping check);
+    ``normalized`` holds the same rows with real values in the date/number
+    columns (what is parsed); ``cell_errors`` rows are rejected outright.
+    """
 
     planned: list[_PlannedRow] = []
     errors: list[SheetValidationError] = []
     seen: set[int | str] = set()
-    start = 1 if (data and _is_header_row(data[0], spec.headers)) else 0
-    for offset, row in enumerate(data[start:], start=start):
-        if _is_empty_row(row):
+    for offset, row in enumerate(data[1:], start=1):  # row 1 is the header
+        if _is_empty_row(row, len(spec.headers)):
             continue
         row_number = offset + 1
         key = _safe_row_key(row)
         try:
-            fields = spec.parse(row)
+            if row_number in cell_errors:
+                raise ValueError(cell_errors[row_number])
+            fields = spec.parse(normalized[offset])
             fields.pop("id")
+            delete = bool(fields.pop("delete", False))
             if key is not None:
                 if key in seen:
                     raise ValueError(f"Duplicate ID: {key}")
                 seen.add(key)
             record = await _find_record(session, spec, key)
+            if delete and record is None:
+                raise ValueError("Nothing to delete: this row has no saved record yet")
             if record is None:
                 spec.require_new(fields)
         except ValueError as exc:
             errors.append(SheetValidationError(row_number, str(exc), key=key))
             continue
-        planned.append(_PlannedRow(row_number, row, key, record, fields))
+        planned.append(_PlannedRow(row_number, row, key, record, fields, delete))
     return planned, errors
 
 
@@ -317,23 +472,46 @@ async def _stamp_pending_keys(
 
 
 async def _import_sheet(
-    session: AsyncSession, client: GoogleSheetsClient, spec: _SheetSpec
+    session: AsyncSession,
+    client: GoogleSheetsClient,
+    spec: _SheetSpec,
+    reports: list[RowReport] | None = None,
+    snapshot: list[list[object]] | None = None,
 ) -> list[SheetValidationError]:
     data = await client.get_values(spec.sheet)
-    planned, errors = await _plan_rows(session, spec, data)
+    if snapshot is not None:
+        snapshot.extend(data)
+    normalized, cell_errors = data, {}
+    if spec.numeric_columns:
+        raw = await client.get_values(spec.sheet, raw=True)
+        normalized, cell_errors = _normalize_rows(data, raw, spec.numeric_columns)
+    planned, errors = await _plan_rows(session, spec, data, normalized, cell_errors)
 
     ready = [item for item in planned if item.key is not None]
+    # Only genuinely new rows are stamped (a deletion always has a saved record).
     ready += await _stamp_pending_keys(client, spec, [i for i in planned if i.key is None])
     ready.sort(key=lambda item: item.row_number)
 
+    accepted: list[RowReport] = []
     await _ensure_outer_transaction(session)
     for item in ready:
         try:
             async with session.begin_nested():
+                if item.delete:
+                    record_id = item.record.id
+                    await spec.delete(session, item.record)
+                    accepted.append(RowReport(item.row_number, record_id, deleted=True))
+                    logger.info(
+                        "Deleted %s %s at the user's request (sheet row %d)",
+                        spec.label, record_id, item.row_number,
+                    )
+                    continue
                 if item.record is None:
-                    await spec.create(session, {**item.fields, "sheet_key": item.key})
+                    record = await spec.create(session, {**item.fields, "sheet_key": item.key})
                 else:
-                    await spec.update(session, item.record, item.fields)
+                    record = item.record
+                    await spec.update(session, record, item.fields)
+                accepted.append(RowReport(item.row_number, record.id))
         except ValueError as exc:
             # Domain validation rejected the row; its savepoint was rolled back.
             errors.append(SheetValidationError(item.row_number, str(exc), key=item.key))
@@ -341,19 +519,29 @@ async def _import_sheet(
     errors.sort(key=lambda error: error.row_number)
     for error in errors:
         logger.warning("Sheet %s: %s", spec.sheet, error)
+    if reports is not None:
+        reports.extend(accepted)
+        reports.extend(RowReport(e.row_number, error=e.message) for e in errors)
+        reports.sort(key=lambda report: report.row_number)
     return errors
 
 
 async def import_events(
-    session: AsyncSession, client: GoogleSheetsClient
+    session: AsyncSession,
+    client: GoogleSheetsClient,
+    *,
+    sheet: str | None = None,
+    reports: list[RowReport] | None = None,
+    snapshot: list[list[object]] | None = None,
 ) -> list[SheetValidationError]:
-    """Create/update events from the Events sheet; return per-row errors.
+    """Create/update/delete events from the Events sheet; return per-row errors.
 
     Valid rows are applied even when other rows are invalid. Nothing is
-    committed: on success the changes remain pending for the caller.
+    committed: on success the changes remain pending for the caller. When a
+    ``reports`` list is given, one :class:`RowReport` per sheet row is added.
     """
 
-    return await _import_sheet(session, client, _EVENTS)
+    return await _import_sheet(session, client, _on_sheet(_EVENTS, sheet), reports, snapshot)
 
 
 async def import_expenses(
@@ -361,11 +549,14 @@ async def import_expenses(
     client: GoogleSheetsClient,
     *,
     today: date | None = None,
+    sheet: str | None = None,
+    reports: list[RowReport] | None = None,
+    snapshot: list[list[object]] | None = None,
 ) -> list[SheetValidationError]:
-    """Create/update expenses from the Expenses sheet (see :func:`import_events`)."""
+    """Create/update/delete expenses from the Expenses sheet (see :func:`import_events`)."""
 
     spec = _EXPENSES if today is None else replace(_EXPENSES, update=_expense_updater(today))
-    return await _import_sheet(session, client, spec)
+    return await _import_sheet(session, client, _on_sheet(spec, sheet), reports, snapshot)
 
 
 # --- record type specs --------------------------------------------------------
@@ -409,6 +600,14 @@ async def _list_expenses(session: AsyncSession) -> list[RecurringExpense]:
     return await expenses.list_expenses(session, active_only=False)
 
 
+async def _delete_event(session: AsyncSession, event: Event) -> None:
+    await events.delete_event(session, event)
+
+
+async def _delete_expense(session: AsyncSession, expense: RecurringExpense) -> None:
+    await expenses.delete_expense(session, expense)
+
+
 _EVENTS = _SheetSpec(
     sheet="Events",
     label="event",
@@ -420,6 +619,10 @@ _EVENTS = _SheetSpec(
     list_all=_list_events,
     create=_create_event,
     update=_update_event,
+    delete=_delete_event,
+    numeric_columns={2: "date"},
+    active_column=6,
+    user_columns=7,
 )
 
 _EXPENSES = _SheetSpec(
@@ -433,4 +636,8 @@ _EXPENSES = _SheetSpec(
     list_all=_list_expenses,
     create=_create_expense,
     update=_expense_updater(None),
+    delete=_delete_expense,
+    numeric_columns={2: "number", 5: "number", 7: "date", 9: "number"},
+    active_column=8,
+    user_columns=10,
 )
