@@ -13,7 +13,7 @@ from datetime import date
 import pytest
 
 from app.config import Settings
-from app.google_sheets.client import GoogleSheetsClient
+from app.google_sheets.client import GoogleSheetsClient, GoogleSheetsError
 from app.google_sheets.feedback import GREEN, RED
 from app.jobs import POLL_PAUSE_AFTER_ERROR, POLL_PAUSE_BAD_RANGE, Services, SheetsSyncError, sheets_poll, sheets_sync
 from tests.test_google_sheets_two_way import EVENTS, EXPENSES, SheetStore, _records, _store, _sync
@@ -244,3 +244,49 @@ def test_raw_reads_use_the_unformatted_render_option() -> None:
     _run(client.get_values("Events"))
     _run(client.get_values("Events", raw=True))
     assert service.render_options == ["FORMATTED_VALUE", "UNFORMATTED_VALUE"]
+
+
+# --- a dropped connection (found by the live run: BrokenPipe after a long idle) --------------------------------
+
+
+class _DroppingService(_RecordingService):
+    def __init__(self, failures: int, error: Exception) -> None:
+        super().__init__()
+        self.failures, self.error, self.calls = failures, error, 0
+
+    def batchUpdate(self, **kwargs):
+        return self
+
+    def execute(self):
+        self.calls += 1
+        if self.calls <= self.failures:
+            raise self.error
+        return {"values": [[1]]}
+
+
+def _client(service) -> GoogleSheetsClient:
+    from app.google_sheets import client as client_module
+
+    client_module._NETWORK_RETRY_PAUSE = 0  # no waiting in tests
+    return GoogleSheetsClient("unused.json", "id", service=service)
+
+
+def test_a_dropped_connection_is_retried_once_for_reads() -> None:
+    service = _DroppingService(1, BrokenPipeError(32, "Broken pipe"))
+    assert _run(_client(service).get_values("Events")) == [[1]]
+    assert service.calls == 2
+
+
+def test_a_persistent_network_failure_becomes_a_sheets_error() -> None:
+    service = _DroppingService(5, ConnectionResetError("reset"))
+    with pytest.raises(GoogleSheetsError) as raised:
+        _run(_client(service).get_values("Events"))
+    assert raised.value.http_status is None and "ConnectionResetError" in raised.value.message
+    assert service.calls == 2  # one retry, not a loop
+
+
+def test_a_non_repeatable_call_is_not_retried() -> None:
+    service = _DroppingService(1, BrokenPipeError(32, "Broken pipe"))
+    with pytest.raises(GoogleSheetsError):
+        _run(_client(service).add_sheet("New"))
+    assert service.calls == 1  # it may have reached Google: never repeated blindly

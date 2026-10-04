@@ -7,7 +7,13 @@ from datetime import datetime
 
 import pytest
 
-from app.gmail.importer import is_allowed_sender
+from app.gmail.importer import is_allowed_sender as _is_allowed
+
+ALLOWED = frozenset({"support@liteserver.nl", "admin@ztv.su"})  # the production list
+
+
+def is_allowed_sender(email):
+    return _is_allowed(email, ALLOWED)
 from app.gmail.parsing import (
     decode_base64url,
     extract_body,

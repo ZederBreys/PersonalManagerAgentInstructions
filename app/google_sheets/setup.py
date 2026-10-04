@@ -19,8 +19,9 @@ from app.google_sheets.client import GoogleSheetsClient
 from app.google_sheets.mappers import (
     EVENT_HEADERS,
     EXPENSE_HEADERS,
+    INBOX_HEADERS,
     REMINDER_HEADERS,
-    SETTINGS_HEADERS,
+    SENDER_HEADERS,
 )
 
 logger = logging.getLogger(__name__)
@@ -28,7 +29,6 @@ logger = logging.getLogger(__name__)
 ROLE_EVENTS = "events"
 ROLE_EXPENSES = "expenses"
 ROLE_REMINDERS = "reminders"
-ROLE_SETTINGS = "settings"
 ROLE_INBOX = "inbox"
 ROLE_EMAIL = "email"
 
@@ -37,9 +37,8 @@ _ROLES: dict[str, tuple[str, list[str] | None]] = {
     ROLE_EVENTS: ("Events", EVENT_HEADERS),
     ROLE_EXPENSES: ("Expenses", EXPENSE_HEADERS),
     ROLE_REMINDERS: ("Reminders", REMINDER_HEADERS),
-    ROLE_SETTINGS: ("Settings", SETTINGS_HEADERS),
-    ROLE_INBOX: ("Inbox", None),  # reserved for later stages
-    ROLE_EMAIL: ("Email", None),
+    ROLE_INBOX: ("Inbox", INBOX_HEADERS),  # export only: the letters the bot received
+    ROLE_EMAIL: ("Email", SENDER_HEADERS),  # the addresses the bot may read
 }
 
 # Old default header texts that are replaced once by the new default.

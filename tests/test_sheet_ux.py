@@ -53,8 +53,8 @@ def _sync_ignoring_row_errors(store) -> None:
 def test_legacy_tabs_are_adopted_and_missing_ones_created(schema: None) -> None:
     store = _store(EVENTS, EVENT_ROW)
     _sync(store)
-    assert set(store.sheets) == {"Events", "Expenses", "Reminders", "Settings", "Inbox", "Email"}
-    assert sorted(store.roles.values()) == sorted(["events", "expenses", "reminders", "settings", "inbox", "email"])
+    assert set(store.sheets) == {"Events", "Expenses", "Reminders", "Inbox", "Email"}
+    assert sorted(store.roles.values()) == sorted(["events", "expenses", "reminders", "inbox", "email"])
     assert store.sheet_id("Events") in store.roles  # the existing tab was adopted, not replaced
 
 

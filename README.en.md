@@ -77,7 +77,7 @@ to the repository.
 
 ## Filling in the Google Sheet
 
-The `Events` and `Expenses` sheets are for entering and editing data. New record: fill in a row and
+The `Events`, `Expenses` and `Email` sheets are for entering and editing data. New record: fill in a row and
 **leave the `ID` column empty**; a few seconds after you stop typing the bot creates the record and
 writes its number into `ID`. A row with an error is skipped and left as typed while the other rows are
 imported.
@@ -128,6 +128,23 @@ allowed. The bot overwrites your own colours and notes in the `ID` column.
 
 An empty cell when editing an existing row means "leave unchanged".
 
+**Email** — the addresses the bot reads mail from. `Отправитель` (sender) is required:
+
+| Column | What to write |
+|---|---|
+| Отправитель | one address: `billing@example.com` (letter case does not matter; `mailto:…` and `Name <address>` are also accepted). Not allowed: a whole domain (`@example.com`, `example.com`), several addresses in one cell, an incomplete address |
+| Активно | `да` / `нет` (or a checkbox); `нет` pauses the address, its mail is not read; empty = `да`; `удалить` — delete the address |
+
+A green `ID` cell means the address was accepted (the note shows it as stored), red means it was not
+(the note gives the reason). A change applies on the next mail import. With no active address the bot
+does not read mail at all. The address is compared exactly; a whole domain is never allowed. The two
+original addresses (`support@liteserver.nl`, `admin@ztv.su`) are added automatically on upgrade.
+
+**Inbox** is view-only: the bot writes the newest 200 received letters here (Moscow time, sender,
+subject, category, importance, summary, whether action is needed, status). Anything typed there by
+hand is overwritten. **Reminders** is view-only too. The bot does not use a `Settings` tab: it can be
+deleted without breaking anything and the bot will not re-create it.
+
 **Speed.** The bot checks the sheet every 5 seconds (`SHEETS_POLL_SECONDS`) with one light request and
 syncs once the edits stop changing — about 5–10 seconds after you stop typing. A full sync still runs
 every 30 minutes as a safety net.
@@ -136,7 +153,7 @@ every 30 minutes as a safety net.
 
 - **Telegram** — push notifications only (job failed/interrupted) via the Bot API (httpx).
 - **Google Sheets** — sync via a service account; every row is validated on its own, invalid rows are skipped and never overwritten by export.
-- **Gmail** — read-only import of messages from whitelisted senders (`support@liteserver.nl`, `admin@ztv.su`), exact address match.
+- **Gmail** — read-only import of messages from allowed senders (the list is the `Email` sheet, stored in the DB), exact address match.
 - **DeepSeek** — semantic classification of incoming messages.
 
 ## Database

@@ -11,12 +11,15 @@ from __future__ import annotations
 
 import re
 import secrets
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 from app.dates import next_occurrence, next_reminder_date
+from app.models.allowed_sender import AllowedSender
 from app.models.event import Event, EventRecurrence
 from app.models.expense import ExpensePeriod, RecurringExpense
+from app.models.inbox import InboxMessage
 from app.models.reminder import Reminder
+from app.senders import normalize_sender
 
 # Columns H and I of Events are filled by the bot (never read back).
 EVENT_HEADERS = [
@@ -38,7 +41,10 @@ EXPENSE_HEADERS = [
     "Напомнить за (дн.)",
 ]
 REMINDER_HEADERS = ["ID", "Event ID", "Напомнить", "Выполнено", "Отправлено", "Отправлено в"]
-SETTINGS_HEADERS = ["Параметр", "Значение"]
+SENDER_HEADERS = ["ID", "Отправитель", "Активно"]
+INBOX_HEADERS = [
+    "ID", "Получено (МСК)", "Отправитель", "Тема", "Категория", "Важность", "Кратко", "Что сделать", "Статус"
+]
 
 _TRUE = "да"
 _FALSE = "нет"
@@ -483,6 +489,65 @@ def parse_expense_row(row: list[object]) -> dict:
         fields["reminder_days_before"] = days[0]
 
     return fields
+
+
+# --- Allowed senders (the Email sheet) -----------------------------------------
+
+def require_new_sender_fields(fields: dict) -> None:
+    """Raise ``ValueError`` unless ``fields`` can create a new sender."""
+
+    _require(fields, {"email": SENDER_HEADERS[1]})
+
+
+def sender_to_row(sender: AllowedSender) -> list[object]:
+    return [sender.id, sender.email, bool_to_str(sender.is_active)]
+
+
+def parse_sender_row(row: list[object]) -> dict:
+    """Parse an Email-sheet row into ``{"id": <row key>, **fields}`` (see parse_event_row)."""
+
+    fields: dict = {"id": parse_row_key(row)}
+    if _is_delete_request(row, 2):
+        return {**fields, "delete": True}
+
+    email = _cell_text(row, 1)
+    if email is not None:
+        fields["email"] = normalize_sender(email)
+
+    active = _cell_text(row, 2)
+    if active is not None:
+        fields["is_active"] = str_to_bool(active)
+
+    return fields
+
+
+# --- Inbox (export-only) ---------------------------------------------------------
+
+_STATUS_WORDS = {
+    "new": "ждёт разбора", "processing": "разбирается", "processed": "разобрано", "failed": "ошибка разбора",
+}
+
+
+def inbox_to_row(message: InboxMessage) -> list[object]:
+    """One received letter. Free text goes through ``text_cell`` so a subject that
+    starts with ``=`` can never become a formula."""
+
+    info = message.metadata_ or {}
+    received = ""
+    if message.received_at is not None:
+        moscow = message.received_at.replace(tzinfo=timezone.utc).astimezone(timezone(timedelta(hours=3)))
+        received = moscow.strftime("%d.%m.%Y %H:%M")
+    return [
+        message.id,
+        received,
+        text_cell(message.sender or ""),
+        text_cell(message.subject or ""),
+        text_cell(message.classification or ""),
+        text_cell(str(info.get("importance") or "")),
+        text_cell(str(info.get("summary") or info.get("error") or "")),
+        "да" if info.get("action_required") is True else "",
+        _STATUS_WORDS.get(message.status.value, message.status.value),
+    ]
 
 
 # --- Reminders (export-only) ----------------------------------------------

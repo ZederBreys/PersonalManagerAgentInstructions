@@ -170,7 +170,7 @@ def test_run_lifecycle_polls_telegram_runs_jobs_and_cleans_up(
         task = asyncio.create_task(main_module.run(services.settings, stop=stop, services=services))
         # Telegram polling answered, and the startup sheets_sync job really ran.
         await _wait_for(lambda: telegram.sent)
-        await _wait_for(lambda: len(sheets.roles) == 6)  # every sheet found/created and marked
+        await _wait_for(lambda: len(sheets.roles) == 5)  # every sheet found/created and marked
         stop.set()
         await task
         assert _other_tasks() == []
@@ -179,7 +179,7 @@ def test_run_lifecycle_polls_telegram_runs_jobs_and_cleans_up(
 
     assert telegram.sent == [(CHAT_ID, bot.HELP_TEXT)]
     assert telegram.closed is True
-    assert set(sheets.sheets) >= {"Events", "Expenses", "Reminders", "Settings", "Inbox", "Email"}
+    assert set(sheets.sheets) >= {"Events", "Expenses", "Reminders", "Inbox", "Email"}
 
     async def _check() -> None:
         run = await _latest_run("sheets_sync")
