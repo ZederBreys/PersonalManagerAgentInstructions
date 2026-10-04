@@ -5,8 +5,8 @@ from __future__ import annotations
 from app.gmail.auth import GmailAuthError, load_credentials
 from app.gmail.client import GmailClient, GmailError, MessageList, create_client_from_settings
 from app.gmail.importer import (
-    ALLOWED_SENDERS,
     ImportStats,
+    build_query,
     import_messages,
     is_allowed_sender,
 )
@@ -21,12 +21,12 @@ from app.gmail.parsing import (
 )
 
 __all__ = [
-    "ALLOWED_SENDERS",
     "GmailAuthError",
     "GmailClient",
     "GmailError",
     "ImportStats",
     "MessageList",
+    "build_query",
     "create_client_from_settings",
     "decode_base64url",
     "extract_body",

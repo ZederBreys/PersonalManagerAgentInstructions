@@ -12,7 +12,20 @@ from sqlalchemy import select
 from app import db
 from app.gmail.client import GmailError, MessageList
 from app.gmail.importer import ImportStats, import_messages
+from app.models.allowed_sender import AllowedSender
 from app.models.inbox import InboxMessage, InboxStatus
+
+
+@pytest.fixture(autouse=True)
+def allowed_senders(schema: None) -> None:
+    """The two addresses every installation starts with (the migration inserts them)."""
+
+    async def seed() -> None:
+        async with db.get_session() as session:
+            session.add_all([AllowedSender(email="support@liteserver.nl"), AllowedSender(email="admin@ztv.su")])
+            await session.commit()
+
+    asyncio.run(seed())
 
 
 def _b64url(text: str) -> str:

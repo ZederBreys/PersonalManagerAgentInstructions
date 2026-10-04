@@ -34,10 +34,12 @@ from app.gmail.client import GmailClient, create_client_from_settings as create_
 from app.gmail.importer import import_messages
 from app.google_sheets.client import GoogleSheetsClient, GoogleSheetsError
 from app.google_sheets.feedback import apply_feedback
-from app.google_sheets.mappers import EVENT_HEADERS, EXPENSE_HEADERS
+from app.google_sheets.mappers import EVENT_HEADERS, EXPENSE_HEADERS, SENDER_HEADERS
 from app.google_sheets.setup import (
+    ROLE_EMAIL,
     ROLE_EVENTS,
     ROLE_EXPENSES,
+    ROLE_INBOX,
     ROLE_REMINDERS,
     SheetLayout,
     ensure_workbook,
@@ -47,9 +49,12 @@ from app.google_sheets.sync import (
     SheetValidationError,
     export_events,
     export_expenses,
+    export_inbox,
     export_reminders,
+    export_senders,
     import_events,
     import_expenses,
+    import_senders,
 )
 from app.inbox_processing import process_unprocessed
 from app.notifications import notify_job_interrupted
@@ -173,7 +178,11 @@ async def health_check(services: Services) -> None:
 # --- Google Sheets --------------------------------------------------------------
 
 
-_SHEET_IMPORTERS = ((ROLE_EVENTS, import_events), (ROLE_EXPENSES, import_expenses))
+_SHEET_IMPORTERS = (
+    (ROLE_EVENTS, import_events),
+    (ROLE_EXPENSES, import_expenses),
+    (ROLE_EMAIL, import_senders),
+)
 
 
 async def _import_from_sheets(
@@ -232,7 +241,12 @@ async def _export_to_sheets(
         session, sheets, preserve=preserved(ROLE_EXPENSES), sheet=layout[ROLE_EXPENSES].title,
         blank_rows=deleted(ROLE_EXPENSES), import_snapshot=(snapshots or {}).get(ROLE_EXPENSES),
     )
+    await export_senders(
+        session, sheets, preserve=preserved(ROLE_EMAIL), sheet=layout[ROLE_EMAIL].title,
+        blank_rows=deleted(ROLE_EMAIL), import_snapshot=(snapshots or {}).get(ROLE_EMAIL),
+    )
     await export_reminders(session, sheets, sheet=layout[ROLE_REMINDERS].title)
+    await export_inbox(session, sheets, sheet=layout[ROLE_INBOX].title)
 
 
 async def _roundtrip(
@@ -298,6 +312,7 @@ async def _snapshot(services: Services) -> SheetSnapshot:
     ranges = [
         f"{layout[ROLE_EVENTS].title}!A:{_last_column(EVENT_HEADERS)}",
         f"{layout[ROLE_EXPENSES].title}!A:{_last_column(EXPENSE_HEADERS)}",
+        f"{layout[ROLE_EMAIL].title}!A:{_last_column(SENDER_HEADERS)}",
     ]
     values = await services.sheets.batch_get(ranges)
     return tuple(tuple(tuple(str(cell) for cell in row) for row in rows) for rows in values)

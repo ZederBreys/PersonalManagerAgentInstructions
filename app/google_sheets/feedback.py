@@ -20,8 +20,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.dates import next_occurrence, next_reminder_date
 from app.google_sheets.client import GoogleSheetsClient
 from app.google_sheets.mappers import date_to_ru, minor_to_display
-from app.google_sheets.setup import ROLE_EVENTS, ROLE_EXPENSES, SheetLayout
+from app.google_sheets.setup import ROLE_EMAIL, ROLE_EVENTS, ROLE_EXPENSES, SheetLayout
 from app.google_sheets.sync import RowReport
+from app.models.allowed_sender import AllowedSender
 from app.models.event import Event, EventRecurrence
 from app.models.expense import RecurringExpense
 
@@ -89,6 +90,16 @@ def expense_note(expense: RecurringExpense, today: date, now: datetime | None = 
     return "\n".join(lines)
 
 
+def sender_note(sender: AllowedSender, today: date, now: datetime | None = None) -> str:
+    lines = [f"✓ Принято · {stamp(now)}", f"Отправитель: {sender.email}"]
+    if sender.is_active:
+        lines.append("Активно: да — письма от этого адреса читаются и попадают в Inbox")
+    else:
+        lines.append("Активно: нет — на паузе, письма от этого адреса не читаются")
+    lines.append("Адрес сравнивается точно (регистр не важен), весь домен не разрешается")
+    return "\n".join(lines)
+
+
 def error_note(message: str, now: datetime | None = None) -> str:
     return (
         f"✗ Строка не принята · {stamp(now)}\n{message}\n"
@@ -129,7 +140,11 @@ async def build_requests(
 ) -> list[dict]:
     today = today or date.today()
     requests: list[dict] = []
-    models = {ROLE_EVENTS: (Event, event_note), ROLE_EXPENSES: (RecurringExpense, expense_note)}
+    models = {
+        ROLE_EVENTS: (Event, event_note),
+        ROLE_EXPENSES: (RecurringExpense, expense_note),
+        ROLE_EMAIL: (AllowedSender, sender_note),
+    }
     for role, (model, note_for) in models.items():
         sheet_id = layout[role].sheet_id
         for report in reports.get(role, []):

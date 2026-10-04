@@ -18,7 +18,9 @@ credentials content.
 from __future__ import annotations
 
 import asyncio
+import http.client
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
@@ -70,6 +72,8 @@ _VALUE_RENDER_OPTION = "FORMATTED_VALUE"
 # The underlying values: numbers stay numbers, dates are serial numbers, whatever
 # number format the user gave the cell. Used where the displayed text is unreliable.
 _VALUE_RENDER_RAW = "UNFORMATTED_VALUE"
+
+_NETWORK_RETRY_PAUSE = 0.5  # seconds before the one retry after a dropped connection
 
 
 class GoogleSheetsError(Exception):
@@ -134,12 +138,32 @@ class GoogleSheetsClient:
         # Serializes service creation and every request (see module docstring).
         self._lock = threading.Lock()
 
-    async def _call(self, func: Callable[..., _T], *args: Any) -> _T:
-        """Run a blocking API call in a worker thread, one call at a time."""
+    async def _call(self, func: Callable[..., _T], *args: Any, retry: bool = False) -> _T:
+        """Run a blocking API call in a worker thread, one call at a time.
+
+        A dropped connection (a keep-alive connection the server closed while the
+        client was idle: broken pipe, reset, timeout) is not an HTTP error. With
+        ``retry`` the call is repeated once on a fresh connection; it is only set
+        for calls that are safe to repeat (reads, overwriting a range, clearing).
+        A network failure that persists becomes a :class:`GoogleSheetsError`, so
+        callers handle it like any other API failure.
+        """
+
+        attempts = 2 if retry else 1
 
         def locked() -> _T:
             with self._lock:
-                return func(*args)
+                for attempt in range(1, attempts + 1):
+                    try:
+                        return func(*args)
+                    except (OSError, http.client.HTTPException) as exc:
+                        if attempt < attempts:
+                            time.sleep(_NETWORK_RETRY_PAUSE)
+                            continue
+                        raise GoogleSheetsError(
+                            message=f"Network error: {type(exc).__name__}: {exc}"
+                        ) from exc
+            raise AssertionError("unreachable")  # pragma: no cover
 
         return await asyncio.to_thread(locked)
 
@@ -155,7 +179,7 @@ class GoogleSheetsClient:
         underlying values instead (see ``_VALUE_RENDER_RAW``).
         """
 
-        return await self._call(self._get_values, range_name, raw)
+        return await self._call(self._get_values, range_name, raw, retry=True)
 
     def _get_values(self, range_name: str, raw: bool = False) -> list[list[object]]:
         from googleapiclient.errors import HttpError
@@ -181,7 +205,7 @@ class GoogleSheetsClient:
     async def update_values(self, range_name: str, values: list[list[object]]) -> None:
         """Overwrite a range with ``values``."""
 
-        await self._call(self._update_values, range_name, values)
+        await self._call(self._update_values, range_name, values, retry=True)
 
     def _update_values(self, range_name: str, values: list[list[object]]) -> None:
         from googleapiclient.errors import HttpError
@@ -222,7 +246,7 @@ class GoogleSheetsClient:
     async def clear(self, range_name: str) -> None:
         """Clear the contents of ``range_name``."""
 
-        await self._call(self._clear, range_name)
+        await self._call(self._clear, range_name, retry=True)
 
     def _clear(self, range_name: str) -> None:
         from googleapiclient.errors import HttpError
@@ -239,7 +263,7 @@ class GoogleSheetsClient:
     async def get_sheet_titles(self) -> list[str]:
         """Return the titles of the existing sheets, in spreadsheet order."""
 
-        return await self._call(self._get_sheet_titles)
+        return await self._call(self._get_sheet_titles, retry=True)
 
     def _get_sheet_titles(self) -> list[str]:
         from googleapiclient.errors import HttpError
@@ -263,7 +287,7 @@ class GoogleSheetsClient:
     async def get_sheets(self) -> list[SheetInfo]:
         """Return every sheet with its stable id and current title."""
 
-        return await self._call(self._get_sheets)
+        return await self._call(self._get_sheets, retry=True)
 
     def _get_sheets(self) -> list[SheetInfo]:
         result = self._execute(
@@ -279,7 +303,7 @@ class GoogleSheetsClient:
     async def get_sheet_roles(self) -> dict[int, str]:
         """Return ``{sheet_id: role}`` for the sheets carrying our hidden marker."""
 
-        return await self._call(self._get_sheet_roles)
+        return await self._call(self._get_sheet_roles, retry=True)
 
     def _get_sheet_roles(self) -> dict[int, str]:
         body = {"dataFilters": [{"developerMetadataLookup": {"metadataKey": METADATA_KEY}}]}
@@ -317,7 +341,7 @@ class GoogleSheetsClient:
     async def batch_get(self, ranges: Sequence[str]) -> list[list[list[object]]]:
         """Read several ranges in ONE request; one list of rows per range."""
 
-        return await self._call(self._batch_get, list(ranges))
+        return await self._call(self._batch_get, list(ranges), retry=True)
 
     def _batch_get(self, ranges: list[str]) -> list[list[list[object]]]:
         result = self._execute(

@@ -38,24 +38,32 @@ from sqlalchemy import select
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app import events, expenses, reminders
+from app import events, expenses, reminders, senders
 from app.google_sheets.client import GoogleSheetsClient
 from app.google_sheets.mappers import (
     EVENT_HEADERS,
     EXPENSE_HEADERS,
+    INBOX_HEADERS,
     REMINDER_HEADERS,
+    SENDER_HEADERS,
     event_to_row,
     expense_to_row,
+    inbox_to_row,
     new_pending_key,
     parse_event_row,
     parse_expense_row,
     parse_row_key,
+    parse_sender_row,
     reminder_to_row,
     require_new_event_fields,
     require_new_expense_fields,
+    require_new_sender_fields,
+    sender_to_row,
 )
+from app.models.allowed_sender import AllowedSender
 from app.models.event import Event
 from app.models.expense import ExpensePeriod, RecurringExpense
+from app.models.inbox import InboxMessage
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +359,37 @@ async def export_reminders(
     await _overwrite_sheet(client, sheet or "Reminders", len(REMINDER_HEADERS), rows)
 
 
+INBOX_SHEET_LIMIT = 200  # the newest letters shown in the Inbox sheet
+
+
+async def export_inbox(
+    session: AsyncSession, client: GoogleSheetsClient, *, sheet: str | None = None
+) -> None:
+    """Overwrite the Inbox sheet with the newest received letters (export-only)."""
+
+    result = await session.execute(
+        select(InboxMessage).order_by(InboxMessage.id.desc()).limit(INBOX_SHEET_LIMIT)
+    )
+    rows = [inbox_to_row(message) for message in result.scalars()]
+    await _overwrite_sheet(client, sheet or "Inbox", len(INBOX_HEADERS), rows)
+
+
+async def export_senders(
+    session: AsyncSession,
+    client: GoogleSheetsClient,
+    *,
+    preserve: Collection[RowKey] = (),
+    sheet: str | None = None,
+    blank_rows: Collection[int] = (),
+    import_snapshot: list[list[object]] | None = None,
+) -> None:
+    """Merge the allowed senders into the Email sheet."""
+
+    await _export_merged(
+        session, client, _on_sheet(_SENDERS, sheet), preserve, blank_rows, import_snapshot
+    )
+
+
 def _on_sheet(spec: _SheetSpec, sheet: str | None) -> _SheetSpec:
     return spec if sheet is None else replace(spec, sheet=sheet)
 
@@ -559,6 +598,19 @@ async def import_expenses(
     return await _import_sheet(session, client, _on_sheet(spec, sheet), reports, snapshot)
 
 
+async def import_senders(
+    session: AsyncSession,
+    client: GoogleSheetsClient,
+    *,
+    sheet: str | None = None,
+    reports: list[RowReport] | None = None,
+    snapshot: list[list[object]] | None = None,
+) -> list[SheetValidationError]:
+    """Create/update/delete allowed Gmail senders from the Email sheet."""
+
+    return await _import_sheet(session, client, _on_sheet(_SENDERS, sheet), reports, snapshot)
+
+
 # --- record type specs --------------------------------------------------------
 
 async def _create_event(session: AsyncSession, fields: dict) -> Event:
@@ -607,6 +659,35 @@ async def _delete_event(session: AsyncSession, event: Event) -> None:
 async def _delete_expense(session: AsyncSession, expense: RecurringExpense) -> None:
     await expenses.delete_expense(session, expense)
 
+
+async def _create_sender(session: AsyncSession, fields: dict) -> AllowedSender:
+    sheet_key = fields.pop("sheet_key")
+    sender = await senders.create_sender(session, **fields)
+    sender.sheet_key = sheet_key
+    await session.flush()
+    return sender
+
+
+async def _update_sender(session: AsyncSession, sender: AllowedSender, fields: dict) -> None:
+    await senders.update_sender(session, sender, **fields)
+
+
+_SENDERS = _SheetSpec(
+    sheet="Email",
+    label="sender",
+    headers=SENDER_HEADERS,
+    model=AllowedSender,
+    parse=parse_sender_row,
+    require_new=require_new_sender_fields,
+    to_row=sender_to_row,
+    list_all=senders.list_senders,
+    create=_create_sender,
+    update=_update_sender,
+    delete=senders.delete_sender,
+    numeric_columns={},
+    active_column=2,
+    user_columns=3,
+)
 
 _EVENTS = _SheetSpec(
     sheet="Events",
