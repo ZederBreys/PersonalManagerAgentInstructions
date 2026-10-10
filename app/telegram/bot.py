@@ -4,9 +4,9 @@ Runs inside the application's asyncio process. Only messages from the
 configured ``TELEGRAM_CHAT_ID`` are answered; everything else is ignored.
 Commands are read-only: nothing here mutates application state.
 
-Natural-language queries ("сколько я трачу на подписки?") are not implemented
-yet — no query logic exists in the project — so free text gets a short
-explanation instead of a guessed answer.
+The only free-text questions understood are expense reports by period
+("сколько я потратил за полгода?", see ``app.expense_report``); anything else
+gets a short explanation instead of a guessed answer.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import logging
 from collections.abc import Sequence
 from typing import Any
 
-from app import db, job_runs, notification_outbox
+from app import db, expense_report, job_runs, notification_outbox
 from app.telegram.client import TelegramAPIError, TelegramClient
 
 logger = logging.getLogger(__name__)
@@ -30,10 +30,12 @@ HELP_TEXT = (
     "Личный менеджер.\n\n"
     "Команды:\n"
     "/status — состояние фоновых задач\n"
-    "/help — эта справка"
+    "/help — эта справка\n\n"
+    "Можно спросить про расходы (по графику платежей): «сколько я потратил за этот месяц», "
+    "«за 3 месяца», «за полгода», «за год», «покажи расходы за март 2026»."
 )
 UNSUPPORTED_TEXT = (
-    "Вопросы в свободной форме пока не поддерживаются.\n\n" + HELP_TEXT
+    "Я понимаю только вопросы о расходах за период.\n\n" + HELP_TEXT
 )
 
 
@@ -74,7 +76,8 @@ async def answer(text: str | None, job_names: Sequence[str]) -> str:
         return HELP_TEXT
     if command == "/status":
         return await status_text(job_names)
-    return UNSUPPORTED_TEXT
+    report = await expense_report.reply(text)
+    return report if report is not None else UNSUPPORTED_TEXT
 
 
 def _message_chat_and_text(update: dict[str, Any]) -> tuple[int | None, str | None]:
